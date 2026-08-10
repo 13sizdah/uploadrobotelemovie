@@ -283,13 +283,22 @@ async def create_app(settings: Settings) -> None:
         await update_progress(force=True)
         async with aiofiles.open(destination, "wb") as target:
             if source_path is not None:
-                async with aiofiles.open(source_path, "rb") as source:
-                    while chunk := await source.read(1024 * 1024):
-                        if cancelled.is_set():
-                            raise UploadCancelled("Upload cancelled by user")
-                        await target.write(chunk)
-                        received += len(chunk)
-                        await update_progress()
+                try:
+                    async with aiofiles.open(source_path, "rb") as source:
+                        while chunk := await source.read(1024 * 1024):
+                            if cancelled.is_set():
+                                raise UploadCancelled("Upload cancelled by user")
+                            await target.write(chunk)
+                            received += len(chunk)
+                            await update_progress()
+                finally:
+                    # Local Bot API keeps a second multi-GB copy indefinitely.
+                    # Only unlink paths inside its dedicated cache mount; Telegram
+                    # can download the file again later from the original file_id.
+                    cache_root = Path("/var/lib/telegram-bot-api")
+                    with suppress(OSError, ValueError):
+                        source_path.resolve().relative_to(cache_root)
+                        await asyncio.to_thread(source_path.unlink, missing_ok=True)
             else:
                 file_base = (settings.telegram_file_base or "https://api.telegram.org").rstrip("/")
                 url = f"{file_base}/file/bot{settings.bot_token}/{telegram_file.file_path}"
@@ -1024,6 +1033,9 @@ async def create_app(settings: Settings) -> None:
                 removed = await cleanup_expired_items()
                 if removed:
                     logger.info("Removed %d expired files", removed)
+                orphaned = await storage.cleanup_orphan_files(min_age_seconds=3600)
+                if orphaned:
+                    logger.info("Removed %d orphaned temporary files", orphaned)
             except Exception:
                 logger.exception("Cleanup failed")
             await asyncio.sleep(settings.cleanup_interval_seconds)

@@ -523,6 +523,28 @@ class Storage:
         except FileNotFoundError:
             pass
 
+    async def cleanup_orphan_files(self, min_age_seconds: int = 3600) -> int:
+        """Remove stale temp files that have no database record after a crash."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT stored_name FROM files")
+            referenced = {str(row[0]) for row in await cursor.fetchall()}
+        cutoff = time.time() - max(60, min_age_seconds)
+
+        def cleanup() -> int:
+            removed = 0
+            for path in self.files_dir.iterdir():
+                if not path.is_file() or path.name in referenced:
+                    continue
+                try:
+                    if path.stat().st_mtime <= cutoff:
+                        path.unlink()
+                        removed += 1
+                except FileNotFoundError:
+                    pass
+            return removed
+
+        return await asyncio.to_thread(cleanup)
+
     async def cleanup_expired(self) -> int:
         now = int(time.time())
         async with aiosqlite.connect(self.db_path) as db:

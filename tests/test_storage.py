@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import tempfile
+import os
+import time
 import unittest
 from pathlib import Path
 
@@ -8,6 +10,26 @@ from app.storage import Storage, StoredFile
 
 
 class StorageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_orphan_cleanup_preserves_database_files(self) -> None:
+        referenced = StoredFile(
+            "kept-token", "kept-file", "kept.bin", "application/octet-stream",
+            10, int(time.time()) + 3600,
+        )
+        await self.storage.add(referenced)
+        kept = self.storage.path_for("kept-file")
+        orphan = self.storage.path_for("orphan-file")
+        kept.write_bytes(b"kept")
+        orphan.write_bytes(b"orphan")
+        old = time.time() - 7200
+        os.utime(kept, (old, old))
+        os.utime(orphan, (old, old))
+
+        removed = await self.storage.cleanup_orphan_files(3600)
+
+        self.assertEqual(removed, 1)
+        self.assertTrue(kept.exists())
+        self.assertFalse(orphan.exists())
+
     async def asyncSetUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory()
         self.storage = Storage(Path(self.temp.name))

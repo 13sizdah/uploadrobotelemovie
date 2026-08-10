@@ -4,6 +4,7 @@ import asyncio
 import logging
 import mimetypes
 import secrets
+import shutil
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -23,6 +24,7 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    FSInputFile,
     Message,
     MessageOriginChannel,
     MessageOriginUser,
@@ -135,6 +137,7 @@ async def create_app(settings: Settings) -> None:
     dispatcher = Dispatcher()
     router = Router()
     admins_adding_source: set[int] = set()
+    bot_started_at = time.monotonic()
 
     def progress_text(received: int, total: int, started_at: float) -> str:
         elapsed = max(time.monotonic() - started_at, 0.001)
@@ -262,12 +265,95 @@ async def create_app(settings: Settings) -> None:
         )
         return InlineKeyboardMarkup(
             inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="وضعیت سرور", callback_data="admin:status"),
+                    InlineKeyboardButton(text="آمار فایل‌ها", callback_data="admin:stats"),
+                ],
+                [
+                    InlineKeyboardButton(text="فایل‌های اخیر", callback_data="admin:files"),
+                    InlineKeyboardButton(text="پاک‌سازی منقضی‌ها", callback_data="admin:cleanup"),
+                ],
+                [InlineKeyboardButton(text="دریافت بکاپ دیتابیس", callback_data="admin:backup")],
                 [InlineKeyboardButton(text=toggle_text, callback_data="admin:toggle_forward")],
                 [InlineKeyboardButton(text="افزودن مبدأ مجاز", callback_data="admin:add_source")],
                 [InlineKeyboardButton(text="مدیریت منابع", callback_data="admin:list_sources")],
                 [InlineKeyboardButton(text="راهنما", callback_data="admin:help")],
             ]
         )
+
+    def format_uptime(seconds: int) -> str:
+        days, remainder = divmod(seconds, 86400)
+        hours, remainder = divmod(remainder, 3600)
+        minutes, _ = divmod(remainder, 60)
+        return f"{days} روز، {hours} ساعت، {minutes} دقیقه"
+
+    async def admin_status_text() -> str:
+        disk = shutil.disk_usage(settings.data_dir)
+        total, active, expired, active_size = await storage.statistics()
+        mode = "فعال" if await forward_only_enabled() else "غیرفعال"
+        return (
+            "وضعیت ربات و فضای ذخیره‌سازی\n\n"
+            f"زمان فعالیت ربات: {format_uptime(int(time.monotonic() - bot_started_at))}\n"
+            f"فضای آزاد: {human_size(disk.free)} از {human_size(disk.total)}\n"
+            f"مصرف فایل‌های فعال: {human_size(active_size)}\n"
+            f"فایل فعال: {active} | منقضی در صف حذف: {expired}\n"
+            f"مجموع رکوردها: {total}\n"
+            f"محدودیت فوروارد: {mode}"
+        )
+
+    async def admin_stats_text() -> str:
+        total, active, expired, active_size = await storage.statistics()
+        sources = await storage.list_sources()
+        return (
+            "آمار ربات\n\n"
+            f"فایل‌های فعال: {active}\n"
+            f"فایل‌های منقضی در انتظار پاک‌سازی: {expired}\n"
+            f"حجم فایل‌های فعال: {human_size(active_size)}\n"
+            f"کل رکوردهای فایل: {total}\n"
+            f"منابع مجاز: {len(sources)}"
+        )
+
+    async def send_metadata_backup(message: Message) -> None:
+        backup_dir = settings.data_dir / "admin-backups"
+        backup_path = backup_dir / f"metadata-{int(time.time())}.sqlite3"
+        try:
+            await storage.create_database_backup(backup_path)
+            await message.answer_document(
+                FSInputFile(backup_path, filename=backup_path.name),
+                caption="بکاپ متادیتای ربات؛ شامل فایل‌های چندگیگابایتی و .env نیست.",
+            )
+        finally:
+            await asyncio.to_thread(backup_path.unlink, missing_ok=True)
+
+    @router.message(Command("status"))
+    async def admin_status_command(message: Message) -> None:
+        if not is_admin(message.from_user.id if message.from_user else None):
+            await message.answer("⛔️ دسترسی ندارید.")
+            return
+        await message.answer(await admin_status_text())
+
+    @router.message(Command("stats"))
+    async def admin_stats_command(message: Message) -> None:
+        if not is_admin(message.from_user.id if message.from_user else None):
+            await message.answer("⛔️ دسترسی ندارید.")
+            return
+        await message.answer(await admin_stats_text())
+
+    @router.message(Command("cleanup"))
+    async def admin_cleanup_command(message: Message) -> None:
+        if not is_admin(message.from_user.id if message.from_user else None):
+            await message.answer("⛔️ دسترسی ندارید.")
+            return
+        removed = await storage.cleanup_expired()
+        await message.answer(f"پاک‌سازی کامل شد؛ {removed} فایل منقضی حذف شد.")
+
+    @router.message(Command("backup"))
+    async def admin_backup_command(message: Message) -> None:
+        if not is_admin(message.from_user.id if message.from_user else None):
+            await message.answer("⛔️ دسترسی ندارید.")
+            return
+        await message.answer("در حال ساخت بکاپ متادیتا…")
+        await send_metadata_backup(message)
 
     @router.message(Command("admin"))
     async def admin_panel(message: Message) -> None:
@@ -295,6 +381,110 @@ async def create_app(settings: Settings) -> None:
                 f"پنل مدیریت ربات\n\nحالت پذیرش فقط از منابع مجاز: {'فعال' if enabled else 'غیرفعال'}",
                 reply_markup=admin_keyboard(enabled),
             )
+
+    @router.callback_query(F.data == "admin:status")
+    async def admin_status(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(await admin_status_text())
+
+    @router.callback_query(F.data == "admin:stats")
+    async def admin_stats(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(await admin_stats_text())
+
+    @router.callback_query(F.data == "admin:cleanup")
+    async def admin_cleanup(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        removed = await storage.cleanup_expired()
+        await callback.answer("پاک‌سازی انجام شد", show_alert=True)
+        if callback.message:
+            await callback.message.answer(f"پاک‌سازی کامل شد؛ {removed} فایل منقضی حذف شد.")
+
+    @router.callback_query(F.data == "admin:files")
+    async def admin_files(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        files = await storage.recent_valid_files()
+        await callback.answer()
+        if not callback.message:
+            return
+        if not files:
+            await callback.message.answer("هیچ فایل فعالی وجود ندارد.")
+            return
+        lines: list[str] = []
+        buttons: list[list[InlineKeyboardButton]] = []
+        for index, item in enumerate(files, start=1):
+            expiry = datetime.fromtimestamp(item.expires_at).astimezone().strftime("%Y/%m/%d %H:%M")
+            lines.append(f"{index}. {item.original_name} — {human_size(item.size)} — {expiry}")
+            buttons.append([
+                InlineKeyboardButton(
+                    text=f"حذف فایل {index}", callback_data=f"admin:file_del:{item.token}"
+                )
+            ])
+        await callback.message.answer(
+            "فایل‌های فعال اخیر:\n\n" + "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    @router.callback_query(F.data.startswith("admin:file_del:"))
+    async def admin_file_delete_prompt(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        token = (callback.data or "").removeprefix("admin:file_del:")
+        if not token:
+            await callback.answer("درخواست نامعتبر است", show_alert=True)
+            return
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "حذف فایل قطعی است و لینک فوراً از کار می‌افتد. ادامه می‌دهید؟",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="تأیید حذف", callback_data=f"admin:file_yes:{token}"),
+                    InlineKeyboardButton(text="انصراف", callback_data="admin:cancel"),
+                ]]),
+            )
+
+    @router.callback_query(F.data.startswith("admin:file_yes:"))
+    async def admin_file_delete_confirm(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        token = (callback.data or "").removeprefix("admin:file_yes:")
+        deleted = await storage.delete_by_token(token)
+        await callback.answer("فایل حذف شد" if deleted else "فایل پیدا نشد", show_alert=True)
+        if callback.message:
+            await callback.message.edit_text("فایل و لینک آن حذف شدند." if deleted else "فایل قبلاً حذف شده بود.")
+
+    @router.callback_query(F.data == "admin:cancel")
+    async def admin_cancel(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        await callback.answer("لغو شد")
+        if callback.message:
+            await callback.message.edit_text("عملیات حذف لغو شد.")
+
+    @router.callback_query(F.data == "admin:backup")
+    async def admin_backup(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        await callback.answer("در حال ساخت بکاپ…")
+        if not callback.message:
+            return
+        await send_metadata_backup(callback.message)
 
     @router.callback_query(F.data == "admin:add_source")
     async def admin_add_source(callback: CallbackQuery) -> None:

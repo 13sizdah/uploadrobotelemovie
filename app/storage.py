@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import sqlite3
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -103,6 +104,52 @@ class Storage:
                 "SELECT source_id, title, source_type FROM allowed_sources ORDER BY created_at DESC"
             )
             return await cursor.fetchall()
+
+    async def statistics(self) -> tuple[int, int, int, int]:
+        now = int(time.time())
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN expires_at > ? THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN expires_at <= ? THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN expires_at > ? THEN size ELSE 0 END), 0)
+                FROM files""",
+                (now, now, now),
+            )
+            row = await cursor.fetchone()
+        assert row is not None
+        return int(row[0]), int(row[1]), int(row[2]), int(row[3])
+
+    async def recent_valid_files(self, limit: int = 8) -> list[StoredFile]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM files WHERE expires_at > ? ORDER BY expires_at DESC LIMIT ?",
+                (int(time.time()), limit),
+            )
+            rows = await cursor.fetchall()
+        return [StoredFile(**dict(row)) for row in rows]
+
+    async def delete_by_token(self, token: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT stored_name FROM files WHERE token = ?", (token,))
+            row = await cursor.fetchone()
+            if row is None:
+                return False
+            await db.execute("DELETE FROM files WHERE token = ?", (token,))
+            await db.commit()
+        await self.delete_stored_file(row[0])
+        return True
+
+    async def create_database_backup(self, destination: Path) -> None:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+
+        def backup() -> None:
+            with sqlite3.connect(self.db_path) as source, sqlite3.connect(destination) as target:
+                source.backup(target)
+
+        await asyncio.to_thread(backup)
 
     async def add(self, item: StoredFile) -> None:
         async with aiosqlite.connect(self.db_path) as db:

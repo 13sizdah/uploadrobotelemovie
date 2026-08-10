@@ -47,6 +47,8 @@ class AdminWebTests(unittest.IsolatedAsyncioTestCase):
             "/manage/storage": "مسیر فایل‌های جدید",
             "/manage/jobs": "صف انتقال پایدار",
             "/manage/system": "وضعیت backendها",
+            "/manage/audit": "رویدادهای مدیریتی",
+            "/manage/settings": "تغییر رمز پنل",
         }
         for path, marker in expected.items():
             response = await self.client.get(path, headers=self.headers)
@@ -66,6 +68,32 @@ class AdminWebTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertNotIn("<script>alert", body)
         self.assertIn("&lt;script&gt;", body)
+
+    async def test_backup_and_password_change_are_persistent(self) -> None:
+        response = await self.client.post(
+            "/manage/backups/create",
+            headers=self.headers,
+            data={"csrf": "csrf-token"},
+            allow_redirects=False,
+        )
+        self.assertEqual(response.status, 302)
+        self.assertEqual(len(list((self.storage.data_dir / "backups").glob("admin-*.sqlite3"))), 1)
+
+        response = await self.client.post(
+            "/manage/settings/password",
+            headers=self.headers,
+            data={
+                "csrf": "csrf-token",
+                "current_password": "a-secure-test-password",
+                "new_password": "a-new-secure-password",
+                "confirm_password": "a-new-secure-password",
+            },
+            allow_redirects=False,
+        )
+        self.assertEqual(response.status, 302)
+        encoded = await self.storage.get_setting("admin_web_password_hash")
+        self.assertTrue(encoded.startswith("pbkdf2_sha256$"))
+        self.assertGreaterEqual(len(await self.storage.recent_audit()), 3)
 
 
 if __name__ == "__main__":

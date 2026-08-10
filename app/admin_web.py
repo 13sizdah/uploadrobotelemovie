@@ -4,6 +4,7 @@ import asyncio
 import html
 import logging
 import os
+import re
 import shutil
 import secrets
 import time
@@ -13,7 +14,7 @@ from datetime import datetime
 from aiohttp import web
 
 from .object_storage import ObjectStorageManager
-from .secure_config import EncryptedConfigStore, verify_password
+from .secure_config import EncryptedConfigStore, hash_password, verify_password
 from .storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -44,10 +45,15 @@ class AdminWeb:
         app.router.add_get("/manage/storage", self.storage_page)
         app.router.add_get("/manage/jobs", self.jobs_page)
         app.router.add_get("/manage/system", self.system_page)
+        app.router.add_get("/manage/audit", self.audit_page)
+        app.router.add_get("/manage/settings", self.settings_page)
+        app.router.add_get("/manage/backups/{name}", self.download_backup)
         app.router.add_post("/manage/login", self.login)
         app.router.add_post("/manage/logout", self.logout)
         app.router.add_post("/manage/files/delete", self.delete_file)
         app.router.add_post("/manage/jobs/retry", self.retry_jobs)
+        app.router.add_post("/manage/settings/password", self.change_password)
+        app.router.add_post("/manage/backups/create", self.create_backup)
         app.router.add_post("/manage/storage/add", self.add_storage)
         app.router.add_post("/manage/storage/mode", self.set_storage_mode)
         app.router.add_post("/manage/storage/replication", self.set_replication)
@@ -72,7 +78,7 @@ class AdminWeb:
     def page(self, body: str, active: str = "", authenticated: bool = False) -> web.Response:
         if not authenticated and "مسیر فایل‌های جدید" in body:
             active, authenticated = "storage", True
-        links = (("dashboard", "/manage/", "داشبورد"), ("files", "/manage/files", "فایل‌ها"), ("storage", "/manage/storage", "فضاها"), ("jobs", "/manage/jobs", "صف انتقال"), ("system", "/manage/system", "سیستم"))
+        links = (("dashboard", "/manage/", "داشبورد"), ("files", "/manage/files", "فایل‌ها"), ("storage", "/manage/storage", "فضاها"), ("jobs", "/manage/jobs", "صف انتقال"), ("system", "/manage/system", "سیستم"), ("audit", "/manage/audit", "رویدادها"), ("settings", "/manage/settings", "تنظیمات"))
         navigation = ""
         if authenticated:
             navigation = '<nav aria-label="منوی مدیریت">' + "".join(
@@ -166,6 +172,77 @@ class AdminWeb:
         body = f'''<section class="grid"><div class="card metric"><span>دیسک آزاد</span><b>{self._size(disk.free)}</b></div><div class="card metric"><span>مصرف دیسک</span><b>{disk.used * 100 / disk.total:.1f}%</b></div><div class="card metric"><span>Load 1m</span><b>{load[0]:.2f}</b></div><div class="card metric"><span>Uptime پردازش</span><b>{self._duration(time.monotonic() - self.started_at)}</b></div></section><section class="card"><h2>وضعیت backendها</h2>{''.join(f'<p><b>{html.escape(item.name)}</b> — {"فعال" if item.enabled else "غیرفعال"} — latency {item.latency_ms:.0f}ms — خطا {item.failures}</p>' for item in self.manager.backends.values()) or '<p class="muted">S3 ثبت نشده است.</p>'}</section>'''
         return self.page(body, "system", True)
 
+    async def audit_page(self, request: web.Request) -> web.Response:
+        if not self.session(request):
+            raise web.HTTPFound("/manage/")
+        rows = []
+        for created_at, actor, action, detail in await self.storage.recent_audit():
+            created = datetime.fromtimestamp(created_at).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            rows.append(
+                f"<tr><td>{created}</td><td><code>{html.escape(actor)}</code></td>"
+                f"<td><code>{html.escape(action)}</code></td><td>{html.escape(detail or '—')}</td></tr>"
+            )
+        table = "".join(rows) or '<tr><td colspan="4" class="muted">رویدادی ثبت نشده است.</td></tr>'
+        return self.page(
+            f'''<section class="card"><h2>رویدادهای مدیریتی</h2><p class="muted">۲۰۰ عملیات معتبر اخیر همراه IP و زمان ثبت می‌شود؛ رمزها و کلیدها در گزارش قرار نمی‌گیرند.</p><div class="table-wrap"><table><thead><tr><th>زمان</th><th>IP</th><th>عملیات</th><th>جزئیات</th></tr></thead><tbody>{table}</tbody></table></div></section>''',
+            "audit", True,
+        )
+
+    async def settings_page(self, request: web.Request) -> web.Response:
+        session = self.session(request)
+        if not session:
+            raise web.HTTPFound("/manage/")
+        backup_dir = self.storage.data_dir / "backups"
+        backups = sorted(backup_dir.glob("admin-*.sqlite3"), reverse=True)[:10] if backup_dir.exists() else []
+        backup_links = "".join(
+            f'<p><a href="/manage/backups/{item.name}">{html.escape(item.name)}</a> — {self._size(item.stat().st_size)}</p>'
+            for item in backups
+        ) or '<p class="muted">هنوز بکاپی ساخته نشده است.</p>'
+        body = f'''<section class="two"><div class="card"><h2>تغییر رمز پنل</h2><form method="post" action="/manage/settings/password"><input type="hidden" name="csrf" value="{session.csrf}"><label>رمز فعلی</label><input name="current_password" type="password" autocomplete="current-password" required><label>رمز جدید</label><input name="new_password" type="password" minlength="12" autocomplete="new-password" required><label>تکرار رمز جدید</label><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required><button>تغییر رمز و خروج سایر نشست‌ها</button></form></div><div class="card"><h2>بکاپ دیتابیس</h2><p class="muted">Snapshot سازگار SQLite؛ شامل فایل‌های حجیم و کلیدهای S3 نیست.</p><form method="post" action="/manage/backups/create"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت بکاپ جدید</button></form>{backup_links}</div></section>'''
+        return self.page(body, "settings", True)
+
+    async def change_password(self, request: web.Request) -> web.Response:
+        session, data = await self.require_form_session(request)
+        current = data.get("current_password", "")
+        new = data.get("new_password", "")
+        confirmation = data.get("confirm_password", "")
+        if not verify_password(current, self.password_hash):
+            raise web.HTTPBadRequest(text="Current password is incorrect")
+        if len(new) < 12 or not secrets.compare_digest(new, confirmation):
+            raise web.HTTPBadRequest(text="New password is invalid or does not match")
+        encoded = hash_password(new)
+        await self.storage.set_setting("admin_web_password_hash", encoded)
+        self.password_hash = encoded
+        token = request.cookies.get("admin_session", "")
+        session.csrf = secrets.token_urlsafe(24)
+        self.sessions = {token: session}
+        await self.storage.add_audit(request.remote or "unknown", "password_changed")
+        raise web.HTTPFound("/manage/settings")
+
+    async def create_backup(self, request: web.Request) -> web.Response:
+        await self.require_form_session(request)
+        backup_dir = self.storage.data_dir / "backups"
+        filename = f"admin-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.sqlite3"
+        await self.storage.create_database_backup(backup_dir / filename)
+        backups = sorted(backup_dir.glob("admin-*.sqlite3"), reverse=True)
+        for old in backups[10:]:
+            old.unlink(missing_ok=True)
+        raise web.HTTPFound("/manage/settings")
+
+    async def download_backup(self, request: web.Request) -> web.StreamResponse:
+        if not self.session(request):
+            raise web.HTTPForbidden(text="Authentication required")
+        name = request.match_info["name"]
+        if not re.fullmatch(r"admin-\d{8}-\d{6}\.sqlite3", name):
+            raise web.HTTPNotFound()
+        path = self.storage.data_dir / "backups" / name
+        if not path.is_file():
+            raise web.HTTPNotFound()
+        response = web.FileResponse(path)
+        response.headers["Content-Disposition"] = f'attachment; filename="{name}"'
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
     async def delete_file(self, request: web.Request) -> web.Response:
         _, data = await self.require_form_session(request)
         item = await self.storage.get(data.get("token", ""))
@@ -228,6 +305,7 @@ class AdminWeb:
         data = {key: str(value).strip() for key, value in (await request.post()).items()}
         if not secrets.compare_digest(data.get("csrf", ""), session.csrf):
             raise web.HTTPForbidden(text="Invalid CSRF token")
+        await self.storage.add_audit(request.remote or "unknown", request.path)
         return session, data
 
     async def logout(self, request: web.Request) -> web.Response:

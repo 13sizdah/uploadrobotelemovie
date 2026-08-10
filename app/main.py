@@ -131,6 +131,9 @@ async def create_app(settings: Settings) -> None:
     await storage.ensure_setting("forward_only", "1" if settings.forward_only else "0")
     await storage.ensure_setting("storage_backend", settings.storage_backend)
     await storage.ensure_setting("replication_count", "1")
+    await storage.ensure_setting(
+        "admin_web_password_hash", settings.admin_web_password_hash or ""
+    )
     encrypted_config = EncryptedConfigStore(settings.data_dir)
     saved_s3_backends = await encrypted_config.load()
     if saved_s3_backends is None and settings.s3_backends:
@@ -939,9 +942,12 @@ async def create_app(settings: Settings) -> None:
     web_app.router.add_get("/d/{token}", download_page)
     web_app.router.add_get("/download/{token}", download_file)
     web_app.router.add_get("/health", health)
-    if settings.admin_web_password_hash:
+    active_admin_password_hash = await storage.get_setting(
+        "admin_web_password_hash", settings.admin_web_password_hash or ""
+    )
+    if active_admin_password_hash:
         AdminWeb(
-            settings.admin_web_password_hash,
+            active_admin_password_hash,
             object_storage,
             encrypted_config,
             storage,
@@ -1025,21 +1031,70 @@ async def create_app(settings: Settings) -> None:
                 logger.exception("Replication worker cycle failed")
                 await asyncio.sleep(5)
 
+    async def automatic_backup_loop() -> None:
+        while True:
+            try:
+                backup_dir = storage.data_dir / "backups"
+                filename = f"auto-{datetime.now().astimezone().strftime('%Y%m%d-%H%M%S')}.sqlite3"
+                await storage.create_database_backup(backup_dir / filename)
+                backups = sorted(backup_dir.glob("auto-*.sqlite3"), reverse=True)
+                for old in backups[7:]:
+                    await asyncio.to_thread(old.unlink, missing_ok=True)
+                logger.info("Automatic database backup created: %s", filename)
+            except Exception:
+                logger.exception("Automatic database backup failed")
+            await asyncio.sleep(24 * 3600)
+
+    async def alert_loop() -> None:
+        disk_alerted = False
+        storage_alerted = False
+        while True:
+            try:
+                disk = shutil.disk_usage(storage.data_dir)
+                disk_high = disk.used / disk.total >= 0.90
+                unhealthy = [
+                    item.name for item in object_storage.backends.values()
+                    if item.enabled and item.unhealthy_until > time.monotonic()
+                ]
+                if settings.admin_user_id and disk_high and not disk_alerted:
+                    await bot.send_message(
+                        settings.admin_user_id,
+                        f"⚠️ هشدار دیسک: {disk.used * 100 / disk.total:.1f}% مصرف شده است.",
+                    )
+                if settings.admin_user_id and unhealthy and not storage_alerted:
+                    await bot.send_message(
+                        settings.admin_user_id,
+                        "⚠️ فضای ذخیره‌سازی ناسالم: " + ", ".join(unhealthy),
+                    )
+                disk_alerted = disk_high
+                storage_alerted = bool(unhealthy)
+            except Exception:
+                logger.exception("Operational alert cycle failed")
+            await asyncio.sleep(300)
+
     cleanup_task = asyncio.create_task(cleanup_loop())
     health_task = asyncio.create_task(storage_health_loop())
     replication_task = asyncio.create_task(replication_loop())
+    backup_task = asyncio.create_task(automatic_backup_loop())
+    alert_task = asyncio.create_task(alert_loop())
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         cleanup_task.cancel()
         health_task.cancel()
         replication_task.cancel()
+        backup_task.cancel()
+        alert_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
         with suppress(asyncio.CancelledError):
             await health_task
         with suppress(asyncio.CancelledError):
             await replication_task
+        with suppress(asyncio.CancelledError):
+            await backup_task
+        with suppress(asyncio.CancelledError):
+            await alert_task
         await runner.cleanup()
         await bot.session.close()
 

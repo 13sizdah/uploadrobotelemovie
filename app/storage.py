@@ -121,6 +121,18 @@ class Storage:
                 "CREATE INDEX IF NOT EXISTS idx_replication_jobs_due "
                 "ON replication_jobs(next_attempt_at, id)"
             )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at INTEGER NOT NULL,
+                    actor TEXT NOT NULL,
+                    action TEXT NOT NULL,
+                    detail TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC)"
+            )
             await db.commit()
 
     async def ensure_setting(self, key: str, default: str) -> None:
@@ -393,6 +405,23 @@ class Storage:
             )
             await db.commit()
         return max(0, cursor.rowcount)
+
+    async def add_audit(self, actor: str, action: str, detail: str = "") -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT INTO audit_log(created_at, actor, action, detail) VALUES (?, ?, ?, ?)",
+                (int(time.time()), actor[:100], action[:150], detail[:500]),
+            )
+            await db.commit()
+
+    async def recent_audit(self, limit: int = 200) -> list[tuple[int, str, str, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT created_at, actor, action, detail FROM audit_log "
+                "ORDER BY id DESC LIMIT ?",
+                (limit,),
+            )
+            return await cursor.fetchall()
 
     async def local_files(self, limit: int = 1000) -> list[StoredFile]:
         async with aiosqlite.connect(self.db_path) as db:

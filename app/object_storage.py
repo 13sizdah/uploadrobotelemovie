@@ -361,6 +361,33 @@ class ObjectStorageManager:
 
         return await asyncio.to_thread(prune)
 
+    async def latest_object_key(self, backend_name: str, prefix: str) -> str | None:
+        backend = self.backends.get(backend_name)
+        if backend is None:
+            raise RuntimeError(f"Unknown S3 backend: {backend_name}")
+
+        def latest() -> str | None:
+            client = backend.client()
+            objects: list[dict[str, object]] = []
+            continuation: str | None = None
+            while True:
+                kwargs: dict[str, object] = {
+                    "Bucket": backend.bucket, "Prefix": prefix, "MaxKeys": 1000
+                }
+                if continuation:
+                    kwargs["ContinuationToken"] = continuation
+                response = client.list_objects_v2(**kwargs)
+                objects.extend(response.get("Contents", []))
+                if not response.get("IsTruncated"):
+                    break
+                continuation = str(response["NextContinuationToken"])
+            if not objects:
+                return None
+            newest = max(objects, key=lambda item: item.get("LastModified", ""))
+            return str(newest["Key"])
+
+        return await asyncio.to_thread(latest)
+
     async def presigned_download(self, backend_name: str, object_key: str, filename: str) -> str:
         backend = self.backends.get(backend_name)
         if backend is None:

@@ -6,7 +6,7 @@ import time
 import unittest
 from pathlib import Path
 
-from app.offsite_backup import create_offsite_backup
+from app.offsite_backup import create_offsite_backup, verify_latest_offsite_backup
 from app.secure_config import EncryptedConfigStore
 from app.storage import Storage, StoredFile
 
@@ -16,17 +16,27 @@ class FakeManager:
         self.upload: tuple[str, str, str] | None = None
         self.members: set[str] = set()
         self.pruned: tuple[str, str, int] | None = None
+        self.archive = b""
+        self.object_key = ""
 
     async def upload_to(
         self, backend: str, source: Path, object_key: str, content_type: str
     ) -> None:
         self.upload = backend, object_key, content_type
+        self.object_key = object_key
+        self.archive = source.read_bytes()
         with tarfile.open(source, "r:gz") as archive:
             self.members = set(archive.getnames())
 
     async def prune_prefix(self, backend: str, prefix: str, keep: int) -> int:
         self.pruned = backend, prefix, keep
         return 0
+
+    async def latest_object_key(self, backend: str, prefix: str) -> str | None:
+        return self.object_key or None
+
+    async def download_to(self, backend: str, object_key: str, destination: Path) -> None:
+        destination.write_bytes(self.archive)
 
 
 class OffsiteBackupTests(unittest.IsolatedAsyncioTestCase):
@@ -62,6 +72,16 @@ class OffsiteBackupTests(unittest.IsolatedAsyncioTestCase):
                 (await storage.get_setting("last_offsite_backup_status")).startswith("ok:backup:")
             )
             self.assertEqual(list((data_dir / "backups").glob("offsite-*")), [])
+
+            result = await verify_latest_offsite_backup(storage, manager, "backup")
+            self.assertEqual(result["file_count"], 1)
+            self.assertEqual(result["backend_count"], 1)
+            self.assertEqual(result["object_key"], key)
+            self.assertTrue(
+                (await storage.get_setting("last_restore_test_status")).startswith(
+                    "ok:backup:system-backups/"
+                )
+            )
 
 
 if __name__ == "__main__":

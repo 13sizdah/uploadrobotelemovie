@@ -14,7 +14,7 @@ from datetime import datetime
 from aiohttp import web
 
 from .object_storage import ObjectStorageManager
-from .offsite_backup import create_offsite_backup
+from .offsite_backup import create_offsite_backup, verify_latest_offsite_backup
 from .secure_config import EncryptedConfigStore, hash_password, verify_password
 from .storage import Storage
 
@@ -75,6 +75,7 @@ class AdminWeb:
         app.router.add_post("/manage/settings/replication-token", self.rotate_replication_token)
         app.router.add_post("/manage/backups/create", self.create_backup)
         app.router.add_post("/manage/backups/offsite", self.create_offsite_backup_now)
+        app.router.add_post("/manage/backups/verify", self.verify_offsite_backup_now)
         app.router.add_post("/manage/settings/operations", self.save_operations_settings)
         app.router.add_post("/manage/storage/add", self.add_storage)
         app.router.add_post("/manage/storage/mode", self.set_storage_mode)
@@ -311,7 +312,8 @@ class AdminWeb:
             for item in self.manager.backends.values() if item.role in {"primary", "replica"}
         )
         last_backup = html.escape(await self.storage.get_setting("last_offsite_backup_status", "هنوز اجرا نشده"))
-        body = f'''<section class="two"><div class="card"><h2>تغییر رمز پنل</h2><form method="post" action="/manage/settings/password"><input type="hidden" name="csrf" value="{session.csrf}"><label>رمز فعلی</label><input name="current_password" type="password" autocomplete="current-password" required><label>رمز جدید</label><input name="new_password" type="password" minlength="12" autocomplete="new-password" required><label>تکرار رمز جدید</label><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required><button>تغییر رمز و خروج سایر نشست‌ها</button></form></div><div class="card"><h2>بکاپ دیتابیس</h2><p class="muted">Snapshot سازگار SQLite؛ شامل فایل‌های حجیم نیست.</p><form method="post" action="/manage/backups/create"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت بکاپ محلی</button></form>{backup_links}</div></section><section class="two"><div class="card"><h2>پایش و هشدار</h2><form method="post" action="/manage/settings/operations"><input type="hidden" name="csrf" value="{session.csrf}"><label>هشدار مصرف دیسک (درصد)</label><input type="number" name="disk_threshold" min="50" max="99" value="{disk_threshold}"><label>هشدار تعداد کارهای صف</label><input type="number" name="queue_threshold" min="1" max="10000" value="{queue_threshold}"><label>مقصد بکاپ روزانه خارج از سرور</label><select name="backup_backend">{backend_options}</select><button>ذخیره تنظیمات عملیاتی</button></form></div><div class="card"><h2>بکاپ خارج از سرور</h2><p class="muted">شامل SQLite و فایل‌های لازم برای بازیابی تنظیمات رمزگذاری‌شده S3 است؛ فایل‌های حجیم داخل آرشیو نیستند.</p><p>آخرین وضعیت: <code>{last_backup}</code></p><form method="post" action="/manage/backups/offsite"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت و ارسال بکاپ اکنون</button></form></div></section><section class="card"><h2>اتصال Worker ایران</h2><p class="muted">این توکن را فقط در فایل <code>.env</code> سرور Worker قرار دهید. توکن به اطلاعات S3 دسترسی مستقیم نمی‌دهد.</p><details><summary>نمایش توکن اتصال</summary><p><code>{replication_token}</code></p></details><form method="post" action="/manage/settings/replication-token"><input type="hidden" name="csrf" value="{session.csrf}"><button class="danger">باطل‌کردن و ساخت توکن جدید</button></form></section>'''
+        last_restore_test = html.escape(await self.storage.get_setting("last_restore_test_status", "هنوز اجرا نشده"))
+        body = f'''<section class="two"><div class="card"><h2>تغییر رمز پنل</h2><form method="post" action="/manage/settings/password"><input type="hidden" name="csrf" value="{session.csrf}"><label>رمز فعلی</label><input name="current_password" type="password" autocomplete="current-password" required><label>رمز جدید</label><input name="new_password" type="password" minlength="12" autocomplete="new-password" required><label>تکرار رمز جدید</label><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required><button>تغییر رمز و خروج سایر نشست‌ها</button></form></div><div class="card"><h2>بکاپ دیتابیس</h2><p class="muted">Snapshot سازگار SQLite؛ شامل فایل‌های حجیم نیست.</p><form method="post" action="/manage/backups/create"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت بکاپ محلی</button></form>{backup_links}</div></section><section class="two"><div class="card"><h2>پایش و هشدار</h2><form method="post" action="/manage/settings/operations"><input type="hidden" name="csrf" value="{session.csrf}"><label>هشدار مصرف دیسک (درصد)</label><input type="number" name="disk_threshold" min="50" max="99" value="{disk_threshold}"><label>هشدار تعداد کارهای صف</label><input type="number" name="queue_threshold" min="1" max="10000" value="{queue_threshold}"><label>مقصد بکاپ روزانه خارج از سرور</label><select name="backup_backend">{backend_options}</select><button>ذخیره تنظیمات عملیاتی</button></form></div><div class="card"><h2>بکاپ خارج از سرور</h2><p class="muted">شامل SQLite و فایل‌های لازم برای بازیابی تنظیمات رمزگذاری‌شده S3 است؛ فایل‌های حجیم داخل آرشیو نیستند.</p><p>آخرین بکاپ: <code>{last_backup}</code></p><form method="post" action="/manage/backups/offsite"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت و ارسال بکاپ اکنون</button></form><hr><p>آخرین آزمایش بازیابی: <code>{last_restore_test}</code></p><form method="post" action="/manage/backups/verify"><input type="hidden" name="csrf" value="{session.csrf}"><button class="secondary">آزمایش امن آخرین بکاپ</button></form></div></section><section class="card"><h2>اتصال Worker ایران</h2><p class="muted">این توکن را فقط در فایل <code>.env</code> سرور Worker قرار دهید. توکن به اطلاعات S3 دسترسی مستقیم نمی‌دهد.</p><details><summary>نمایش توکن اتصال</summary><p><code>{replication_token}</code></p></details><form method="post" action="/manage/settings/replication-token"><input type="hidden" name="csrf" value="{session.csrf}"><button class="danger">باطل‌کردن و ساخت توکن جدید</button></form></section>'''
         return self.page(body, "settings", True)
 
     async def change_password(self, request: web.Request) -> web.Response:
@@ -355,6 +357,18 @@ class AdminWeb:
             raise web.HTTPBadRequest(text="Offsite backup backend is not configured")
         await create_offsite_backup(self.storage, self.store, self.manager, backend)
         await self.storage.add_audit(request.remote or "unknown", "offsite_backup_created", backend)
+        raise web.HTTPFound("/manage/settings")
+
+    async def verify_offsite_backup_now(self, request: web.Request) -> web.Response:
+        await self.require_form_session(request)
+        backend = await self.storage.get_setting("offsite_backup_backend", "")
+        if not backend or backend not in self.manager.backends:
+            raise web.HTTPBadRequest(text="Offsite backup backend is not configured")
+        result = await verify_latest_offsite_backup(self.storage, self.manager, backend)
+        await self.storage.add_audit(
+            request.remote or "unknown", "offsite_backup_verified",
+            f"{backend}:{result['file_count']}",
+        )
         raise web.HTTPFound("/manage/settings")
 
     async def save_operations_settings(self, request: web.Request) -> web.Response:

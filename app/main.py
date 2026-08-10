@@ -6,8 +6,10 @@ import mimetypes
 import secrets
 import time
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+from typing import Any
 
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
@@ -23,6 +25,49 @@ from .storage import Storage, StoredFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class IncomingFile:
+    downloadable: Any
+    file_size: int | None
+    file_name: str
+    mime_type: str
+
+
+def incoming_file(message: Message) -> IncomingFile | None:
+    """Return a normalized downloadable file for every Telegram media type."""
+    if message.document:
+        item = message.document
+        return IncomingFile(item, item.file_size, item.file_name or "document", item.mime_type or "application/octet-stream")
+    if message.video:
+        item = message.video
+        return IncomingFile(item, item.file_size, item.file_name or "video.mp4", item.mime_type or "video/mp4")
+    if message.audio:
+        item = message.audio
+        return IncomingFile(item, item.file_size, item.file_name or "audio.mp3", item.mime_type or "audio/mpeg")
+    if message.animation:
+        item = message.animation
+        return IncomingFile(item, item.file_size, item.file_name or "animation.mp4", item.mime_type or "video/mp4")
+    if message.voice:
+        item = message.voice
+        return IncomingFile(item, item.file_size, "voice.ogg", item.mime_type or "audio/ogg")
+    if message.video_note:
+        item = message.video_note
+        return IncomingFile(item, item.file_size, "video-note.mp4", "video/mp4")
+    if message.sticker:
+        item = message.sticker
+        if item.is_animated:
+            name, mime = "sticker.tgs", "application/x-tgsticker"
+        elif item.is_video:
+            name, mime = "sticker.webm", "video/webm"
+        else:
+            name, mime = "sticker.webp", "image/webp"
+        return IncomingFile(item, item.file_size, name, mime)
+    if message.photo:
+        item = max(message.photo, key=lambda photo: photo.file_size or 0)
+        return IncomingFile(item, item.file_size, "photo.jpg", "image/jpeg")
+    return None
 
 
 def safe_filename(name: str | None) -> str:
@@ -70,7 +115,8 @@ async def create_app(settings: Settings) -> None:
             await message.answer("⛔️ شما اجازه استفاده از این ربات را ندارید.")
             return
         await message.answer(
-            "سلام! فایل را به‌صورت Document برای من بفرستید.\n"
+            "سلام! فایل یا رسانه موردنظر را برای من بفرستید.\n"
+            "فرمت‌های فایل، ویدئو، عکس، صوت، ویس، GIF و استیکر پشتیبانی می‌شوند.\n"
             + (
                 f"حداکثر حجم: {settings.max_file_size_mb} مگابایت\n"
                 if settings.max_file_size_mb
@@ -80,15 +126,19 @@ async def create_app(settings: Settings) -> None:
             f"زمان اعتبار لینک: {settings.file_ttl_hours} ساعت"
         )
 
-    @router.message(F.document)
-    async def receive_document(message: Message) -> None:
+    @router.message(
+        F.document | F.video | F.audio | F.animation | F.voice | F.video_note | F.sticker | F.photo
+    )
+    async def receive_media(message: Message) -> None:
         if not is_allowed(message):
             await message.answer("⛔️ شما اجازه استفاده از این ربات را ندارید.")
             return
-        document = message.document
-        assert document is not None
+        media = incoming_file(message)
+        if media is None:
+            await message.answer("❌ این پیام حاوی فایل قابل دریافت نیست.")
+            return
         max_bytes = settings.max_file_size_mb * 1024 * 1024 if settings.max_file_size_mb else 0
-        if max_bytes and document.file_size and document.file_size > max_bytes:
+        if max_bytes and media.file_size and media.file_size > max_bytes:
             await message.answer(f"❌ حجم فایل بیشتر از {settings.max_file_size_mb} مگابایت است.")
             return
 
@@ -96,9 +146,9 @@ async def create_app(settings: Settings) -> None:
         token = secrets.token_urlsafe(32)
         stored_name = secrets.token_hex(16)
         destination = storage.path_for(stored_name)
-        original_name = safe_filename(document.file_name)
+        original_name = safe_filename(media.file_name)
         try:
-            await bot.download(document, destination=destination)
+            await bot.download(media.downloadable, destination=destination)
             actual_size = destination.stat().st_size
             if max_bytes and actual_size > max_bytes:
                 await storage.delete_stored_file(stored_name)
@@ -110,7 +160,7 @@ async def create_app(settings: Settings) -> None:
                     token=token,
                     stored_name=stored_name,
                     original_name=original_name,
-                    mime_type=document.mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
+                    mime_type=media.mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
                     size=actual_size,
                     expires_at=expires_at,
                 )
@@ -132,7 +182,7 @@ async def create_app(settings: Settings) -> None:
     @router.message()
     async def unsupported(message: Message) -> None:
         if is_allowed(message):
-            await message.answer("لطفاً فایل را به‌صورت Document ارسال کنید.")
+            await message.answer("لطفاً یک فایل، ویدئو، عکس، صوت، ویس، GIF یا استیکر ارسال کنید.")
 
     dispatcher.include_router(router)
 

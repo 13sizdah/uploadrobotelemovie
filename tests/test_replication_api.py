@@ -96,6 +96,19 @@ class ReplicationAPITests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(valid.status, 200)
 
+    async def test_disabled_worker_cannot_claim_new_jobs(self) -> None:
+        first = await self.client.post(
+            "/internal/replication/claim", headers=self.headers,
+            json={"worker_id": "iran-disabled", "targets": ["unknown"]},
+        )
+        self.assertEqual(first.status, 204)
+        await self.storage.set_worker_enabled("iran-disabled", False)
+        rejected = await self.client.post(
+            "/internal/replication/claim", headers=self.headers,
+            json={"worker_id": "iran-disabled", "targets": ["parspack"]},
+        )
+        self.assertEqual(rejected.status, 403)
+
 
 if __name__ == "__main__":
     unittest.main()

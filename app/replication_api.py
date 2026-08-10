@@ -45,6 +45,8 @@ class ReplicationAPI:
         targets = [str(value)[:100] for value in data.get("targets", []) if value]
         if not worker_id or not targets or len(targets) > 20:
             raise web.HTTPBadRequest(text="worker_id and targets are required")
+        if not await self.storage.worker_is_enabled(worker_id):
+            raise web.HTTPForbidden(text="Worker is disabled by administrator")
         job = await self.storage.claim_replication_job(worker_id, targets)
         if job is None:
             return web.Response(status=204)

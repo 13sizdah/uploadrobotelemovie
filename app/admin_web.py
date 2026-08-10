@@ -71,6 +71,9 @@ class AdminWeb:
         app.router.add_post("/manage/files/expiry", self.change_file_expiry)
         app.router.add_post("/manage/jobs/retry", self.retry_jobs)
         app.router.add_post("/manage/jobs/pause", self.toggle_replication_pause)
+        app.router.add_post("/manage/jobs/cancel", self.cancel_replication_job)
+        app.router.add_post("/manage/workers/toggle", self.toggle_worker)
+        app.router.add_post("/manage/workers/release", self.release_worker)
         app.router.add_post("/manage/settings/password", self.change_password)
         app.router.add_post("/manage/settings/replication-token", self.rotate_replication_token)
         app.router.add_post("/manage/backups/create", self.create_backup)
@@ -231,20 +234,24 @@ class AdminWeb:
         rows = []
         for job in await self.storage.admin_replication_jobs():
             retry = datetime.fromtimestamp(job.next_attempt_at).astimezone().strftime("%Y-%m-%d %H:%M:%S") if job.next_attempt_at else "اکنون"
-            rows.append(f'''<tr><td>{job.id}</td><td>{html.escape(job.original_name)}</td><td>{html.escape(job.target_backend)}</td><td>{job.attempts}</td><td>{retry}</td><td>{html.escape(job.last_error or "—")}</td></tr>''')
-        table = "".join(rows) or '<tr><td colspan="6" class="muted">صف خالی است.</td></tr>'
+            claimed = html.escape(job.claimed_by) if job.claimed_by else "—"
+            active_lease = bool(job.claimed_by and job.lease_until > int(time.time()))
+            cancel = '<span class="muted">در حال انتقال</span>' if active_lease else f'''<form method="post" action="/manage/jobs/cancel"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="job_id" value="{job.id}"><button class="danger">لغو Replica</button></form>'''
+            rows.append(f'''<tr><td>{job.id}</td><td>{html.escape(job.original_name)}</td><td>{html.escape(job.target_backend)}</td><td>{job.attempts}</td><td>{retry}</td><td>{claimed}<br>{html.escape(job.last_error or "—")}</td><td>{cancel}</td></tr>''')
+        table = "".join(rows) or '<tr><td colspan="7" class="muted">صف خالی است.</td></tr>'
         state = "متوقف" if paused else "در حال اجرا"
         action = "ادامه صف" if paused else "توقف صف"
         workers = []
         now = int(time.time())
-        for worker_id, last_seen, current_job, completed, last_error, targets in await self.storage.replication_workers():
-            online = now - last_seen < 600
+        for worker_id, last_seen, current_job, completed, last_error, targets, enabled in await self.storage.replication_workers():
+            online = bool(enabled) and now - last_seen < 600
             seen = datetime.fromtimestamp(last_seen).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            worker_value = html.escape(worker_id, quote=True)
             workers.append(
-                f'''<tr><td><code>{html.escape(worker_id)}</code><br><small>{html.escape(targets)}</small></td><td><span class="badge">{"آنلاین" if online else "آفلاین"}</span></td><td>{current_job or "—"}</td><td>{completed}</td><td>{seen}</td><td>{html.escape(last_error or "—")}</td></tr>'''
+                f'''<tr><td><code>{html.escape(worker_id)}</code><br><small>{html.escape(targets)}</small></td><td><span class="badge">{"آنلاین" if online else ("آفلاین" if enabled else "غیرفعال")}</span></td><td>{current_job or "—"}</td><td>{completed}</td><td>{seen}</td><td>{html.escape(last_error or "—")}</td><td><form class="inline" method="post" action="/manage/workers/toggle"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="worker_id" value="{worker_value}"><input type="hidden" name="enabled" value="{0 if enabled else 1}"><button class="secondary">{"غیرفعال" if enabled else "فعال"}</button></form><form class="inline" method="post" action="/manage/workers/release"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="worker_id" value="{worker_value}"><button class="danger">آزادکردن Lease</button></form></td></tr>'''
             )
-        worker_table = "".join(workers) or '<tr><td colspan="6" class="muted">هنوز Worker خارجی متصل نشده است.</td></tr>'
-        return self.page(f'''<section class="card"><h2>صف انتقال پایدار</h2><p>وضعیت: <b>{state}</b></p><p class="muted">کارهای ناموفق بعد از restart باقی می‌مانند و با فاصله افزایشی دوباره اجرا می‌شوند.</p><div class="row"><form method="post" action="/manage/jobs/pause"><input type="hidden" name="csrf" value="{session.csrf}"><button class="secondary">{action}</button></form><form method="post" action="/manage/jobs/retry"><input type="hidden" name="csrf" value="{session.csrf}"><button>اجرای دوباره همه کارها</button></form></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>فایل</th><th>مقصد</th><th>تلاش</th><th>اجرای بعد</th><th>آخرین خطا</th></tr></thead><tbody>{table}</tbody></table></div></section><section class="card"><h2>Workerهای انتقال</h2><p class="muted">Worker ایران بدون پورت ورودی، صف را از این سرور دریافت می‌کند و انتقال قطع‌شده را ادامه می‌دهد.</p><div class="table-wrap"><table><thead><tr><th>نام</th><th>وضعیت</th><th>کار جاری</th><th>تکمیل‌شده</th><th>آخرین اتصال</th><th>خطا</th></tr></thead><tbody>{worker_table}</tbody></table></div></section>''', "jobs", True)
+        worker_table = "".join(workers) or '<tr><td colspan="7" class="muted">هنوز Worker خارجی متصل نشده است.</td></tr>'
+        return self.page(f'''<section class="card"><h2>صف انتقال پایدار</h2><p>وضعیت: <b>{state}</b></p><p class="muted">کارهای ناموفق بعد از restart باقی می‌مانند و با فاصله افزایشی دوباره اجرا می‌شوند. لغو Replica فایل اصلی را حذف نمی‌کند.</p><div class="row"><form method="post" action="/manage/jobs/pause"><input type="hidden" name="csrf" value="{session.csrf}"><button class="secondary">{action}</button></form><form method="post" action="/manage/jobs/retry"><input type="hidden" name="csrf" value="{session.csrf}"><button>اجرای دوباره همه کارها</button></form></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>فایل</th><th>مقصد</th><th>تلاش</th><th>اجرای بعد</th><th>Worker/خطا</th><th>عملیات</th></tr></thead><tbody>{table}</tbody></table></div></section><section class="card"><h2>Workerهای انتقال</h2><p class="muted">غیرفعال‌کردن مانع دریافت کار جدید می‌شود. Lease را فقط وقتی Worker واقعاً خاموش است آزاد کنید.</p><div class="table-wrap"><table><thead><tr><th>نام</th><th>وضعیت</th><th>کار جاری</th><th>تکمیل‌شده</th><th>آخرین اتصال</th><th>خطا</th><th>عملیات</th></tr></thead><tbody>{worker_table}</tbody></table></div></section>''', "jobs", True)
 
     async def system_page(self, request: web.Request) -> web.Response:
         session = self.session(request)
@@ -449,6 +456,43 @@ class AdminWeb:
         await self.require_form_session(request)
         paused = await self.storage.get_setting("replication_paused", "0") == "1"
         await self.storage.set_setting("replication_paused", "0" if paused else "1")
+        raise web.HTTPFound("/manage/jobs")
+
+    async def cancel_replication_job(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        try:
+            job_id = int(data.get("job_id", "0"))
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text="Invalid job id") from exc
+        token = await self.storage.cancel_replication_job(job_id)
+        if token is None:
+            raise web.HTTPConflict(text="Active replication cannot be cancelled; disable its worker first")
+        await self.storage.add_audit(request.remote or "unknown", "replication_job_cancelled", str(job_id))
+        item = await self.storage.get(token)
+        if item and await self.storage.pending_replication_count(token) == 0:
+            await self.storage.delete_stored_file(item.stored_name)
+        raise web.HTTPFound("/manage/jobs")
+
+    async def toggle_worker(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        worker_id = data.get("worker_id", "")[:100]
+        enabled = data.get("enabled", "0") == "1"
+        if not worker_id or not await self.storage.set_worker_enabled(worker_id, enabled):
+            raise web.HTTPNotFound(text="Worker not found")
+        await self.storage.add_audit(
+            request.remote or "unknown", "worker_enabled" if enabled else "worker_disabled", worker_id
+        )
+        raise web.HTTPFound("/manage/jobs")
+
+    async def release_worker(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        worker_id = data.get("worker_id", "")[:100]
+        if not worker_id:
+            raise web.HTTPBadRequest(text="Worker id is required")
+        released = await self.storage.release_worker_lease(worker_id)
+        await self.storage.add_audit(
+            request.remote or "unknown", "worker_lease_released", f"{worker_id}:{released}"
+        )
         raise web.HTTPFound("/manage/jobs")
 
     @staticmethod

@@ -64,6 +64,8 @@ class AdminReplicationJob:
     attempts: int
     next_attempt_at: int
     last_error: str
+    claimed_by: str
+    lease_until: int
 
 
 class Storage:
@@ -154,7 +156,8 @@ class Storage:
                     current_job INTEGER,
                     completed_count INTEGER NOT NULL DEFAULT 0,
                     last_error TEXT NOT NULL DEFAULT '',
-                    targets TEXT NOT NULL DEFAULT ''
+                    targets TEXT NOT NULL DEFAULT '',
+                    enabled INTEGER NOT NULL DEFAULT 1
                 )"""
             )
             worker_columns = {
@@ -164,6 +167,10 @@ class Storage:
             if "targets" not in worker_columns:
                 await db.execute(
                     "ALTER TABLE replication_workers ADD COLUMN targets TEXT NOT NULL DEFAULT ''"
+                )
+            if "enabled" not in worker_columns:
+                await db.execute(
+                    "ALTER TABLE replication_workers ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"
                 )
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS audit_log (
@@ -520,20 +527,69 @@ class Storage:
             await db.commit()
         return cursor.rowcount == 1
 
-    async def replication_workers(self) -> list[tuple[str, int, int | None, int, str, str]]:
+    async def replication_workers(self) -> list[tuple[str, int, int | None, int, str, str, int]]:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT worker_id, last_seen, current_job, completed_count, last_error, targets
+                """SELECT worker_id, last_seen, current_job, completed_count,
+                          last_error, targets, enabled
                    FROM replication_workers ORDER BY last_seen DESC"""
             )
             return await cursor.fetchall()
+
+    async def worker_is_enabled(self, worker_id: str) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT enabled FROM replication_workers WHERE worker_id = ?", (worker_id,)
+            )
+            row = await cursor.fetchone()
+        return row is None or bool(row[0])
+
+    async def set_worker_enabled(self, worker_id: str, enabled: bool) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE replication_workers SET enabled = ? WHERE worker_id = ?",
+                (1 if enabled else 0, worker_id),
+            )
+            await db.commit()
+        return cursor.rowcount == 1
+
+    async def release_worker_lease(self, worker_id: str) -> int:
+        now = int(time.time())
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE replication_jobs SET claimed_by = '', lease_until = 0,
+                   next_attempt_at = 0, updated_at = ? WHERE claimed_by = ?""",
+                (now, worker_id),
+            )
+            await db.execute(
+                "UPDATE replication_workers SET current_job = NULL WHERE worker_id = ?",
+                (worker_id,),
+            )
+            await db.commit()
+        return max(0, cursor.rowcount)
+
+    async def cancel_replication_job(self, job_id: int) -> str | None:
+        now = int(time.time())
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT token FROM replication_jobs WHERE id = ?
+                   AND (claimed_by = '' OR lease_until <= ?)""",
+                (job_id, now),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                return None
+            await db.execute("DELETE FROM replication_jobs WHERE id = ?", (job_id,))
+            await db.commit()
+        return str(row[0])
 
     async def active_worker_targets(self, max_age_seconds: int = 600) -> tuple[str, ...]:
         cutoff = int(time.time()) - max_age_seconds
         targets: set[str] = set()
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                "SELECT targets FROM replication_workers WHERE last_seen >= ?", (cutoff,)
+                "SELECT targets FROM replication_workers WHERE last_seen >= ? AND enabled = 1",
+                (cutoff,),
             )
             for row in await cursor.fetchall():
                 targets.update(value.strip() for value in row[0].split(",") if value.strip())
@@ -588,7 +644,8 @@ class Storage:
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
                 """SELECT j.id, j.token, f.original_name, j.target_backend,
-                          j.attempts, j.next_attempt_at, j.last_error
+                          j.attempts, j.next_attempt_at, j.last_error,
+                          j.claimed_by, j.lease_until
                    FROM replication_jobs j JOIN files f ON f.token = j.token
                    ORDER BY j.next_attempt_at, j.id LIMIT ?""",
                 (limit,),

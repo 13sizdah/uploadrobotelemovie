@@ -144,6 +144,47 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(by_backend["bunny"], (2, 350))
         self.assertEqual(by_backend["parspack"], (1, 50))
 
+    async def test_worker_can_be_disabled_and_lease_released(self) -> None:
+        item = StoredFile(
+            "worker-control", "spool", "movie.mkv", "video/x-matroska",
+            500, 4_000_000_000, "bunny", "files/worker-control",
+        )
+        await self.storage.add_with_replication_jobs(
+            item, [("parspack", "files/worker-control")]
+        )
+        job = await self.storage.claim_replication_job("iran-1", ["parspack"])
+        self.assertIsNotNone(job)
+        self.assertTrue(await self.storage.worker_is_enabled("iran-1"))
+        self.assertTrue(await self.storage.set_worker_enabled("iran-1", False))
+        self.assertFalse(await self.storage.worker_is_enabled("iran-1"))
+        self.assertEqual(await self.storage.active_worker_targets(), ())
+        self.assertEqual(await self.storage.release_worker_lease("iran-1"), 1)
+        self.assertEqual(len(await self.storage.due_replication_jobs()), 1)
+
+    async def test_active_replication_cannot_be_cancelled(self) -> None:
+        item = StoredFile(
+            "cancel-control", "spool", "movie.mkv", "video/x-matroska",
+            500, 4_000_000_000, "bunny", "files/cancel-control",
+        )
+        await self.storage.add_with_replication_jobs(
+            item, [("parspack", "files/cancel-control")]
+        )
+        pending = (await self.storage.due_replication_jobs())[0]
+        self.assertEqual(
+            await self.storage.cancel_replication_job(pending.id), "cancel-control"
+        )
+
+        await self.storage.add_with_replication_jobs(
+            StoredFile(
+                "active-cancel", "spool-2", "movie2.mkv", "video/x-matroska",
+                500, 4_000_000_000, "bunny", "files/active-cancel",
+            ),
+            [("parspack", "files/active-cancel")],
+        )
+        claimed = await self.storage.claim_replication_job("iran-2", ["parspack"])
+        self.assertIsNotNone(claimed)
+        self.assertIsNone(await self.storage.cancel_replication_job(claimed.id))
+
 
 if __name__ == "__main__":
     unittest.main()

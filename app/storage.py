@@ -201,6 +201,15 @@ class Storage:
             row = await cursor.fetchone()
         return row[0] if row else default
 
+    async def update_expiry(self, token: str, expires_at: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE files SET expires_at = ? WHERE token = ?",
+                (expires_at, token),
+            )
+            await db.commit()
+        return cursor.rowcount == 1
+
     async def add_source(self, source_id: int, title: str, source_type: str) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(

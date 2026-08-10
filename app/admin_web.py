@@ -14,6 +14,7 @@ from datetime import datetime
 from aiohttp import web
 
 from .object_storage import ObjectStorageManager
+from .offsite_backup import create_offsite_backup
 from .secure_config import EncryptedConfigStore, hash_password, verify_password
 from .storage import Storage
 
@@ -66,11 +67,14 @@ class AdminWeb:
         app.router.add_post("/manage/login", self.login)
         app.router.add_post("/manage/logout", self.logout)
         app.router.add_post("/manage/files/delete", self.delete_file)
+        app.router.add_post("/manage/files/expiry", self.change_file_expiry)
         app.router.add_post("/manage/jobs/retry", self.retry_jobs)
         app.router.add_post("/manage/jobs/pause", self.toggle_replication_pause)
         app.router.add_post("/manage/settings/password", self.change_password)
         app.router.add_post("/manage/settings/replication-token", self.rotate_replication_token)
         app.router.add_post("/manage/backups/create", self.create_backup)
+        app.router.add_post("/manage/backups/offsite", self.create_offsite_backup_now)
+        app.router.add_post("/manage/settings/operations", self.save_operations_settings)
         app.router.add_post("/manage/storage/add", self.add_storage)
         app.router.add_post("/manage/storage/mode", self.set_storage_mode)
         app.router.add_post("/manage/storage/replication", self.set_replication)
@@ -213,7 +217,7 @@ class AdminWeb:
         for item in await self.storage.admin_files():
             state = "فعال" if item.expires_at > now else "منقضی"
             expires = datetime.fromtimestamp(item.expires_at).astimezone().strftime("%Y-%m-%d %H:%M")
-            rows.append(f'''<tr><td>{html.escape(item.original_name)}</td><td>{self._size(item.size)}</td><td><span class="badge">{html.escape(item.backend_name)}</span></td><td>{item.replica_count} / صف {item.pending_count}</td><td>{expires}<br><span class="muted">{state}</span></td><td><a href="/d/{item.token}" target="_blank">نمایش</a> <form class="inline" method="post" action="/manage/files/delete"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="token" value="{item.token}"><button class="danger">حذف</button></form></td></tr>''')
+            rows.append(f'''<tr><td>{html.escape(item.original_name)}</td><td>{self._size(item.size)}</td><td><span class="badge">{html.escape(item.backend_name)}</span></td><td>{item.replica_count} / صف {item.pending_count}</td><td>{expires}<br><span class="muted">{state}</span><form method="post" action="/manage/files/expiry"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="token" value="{item.token}"><select name="action"><option value="24">تمدید ۲۴ ساعت</option><option value="168">تمدید ۷ روز</option><option value="720">تمدید ۳۰ روز</option><option value="permanent">دائمی</option></select><button class="secondary">اعمال</button></form></td><td><a href="/d/{item.token}" target="_blank">نمایش</a> <form class="inline" method="post" action="/manage/files/delete"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="token" value="{item.token}"><button class="danger">حذف</button></form></td></tr>''')
         table = "".join(rows) or '<tr><td colspan="6" class="muted">فایلی ثبت نشده است.</td></tr>'
         return self.page(f'''<section class="card"><h2>فایل‌ها</h2><p class="muted">۱۰۰ فایل اخیر؛ حذف شامل نسخه اصلی، replicaها، صف و فایل موقت است.</p><div class="table-wrap"><table><thead><tr><th>نام</th><th>حجم</th><th>محل اصلی</th><th>نسخه‌ها</th><th>انقضا</th><th>عملیات</th></tr></thead><tbody>{table}</tbody></table></div></section>''', "files", True)
 
@@ -276,7 +280,15 @@ class AdminWeb:
             for item in backups
         ) or '<p class="muted">هنوز بکاپی ساخته نشده است.</p>'
         replication_token = html.escape(await self.storage.get_setting("replication_api_token"))
-        body = f'''<section class="two"><div class="card"><h2>تغییر رمز پنل</h2><form method="post" action="/manage/settings/password"><input type="hidden" name="csrf" value="{session.csrf}"><label>رمز فعلی</label><input name="current_password" type="password" autocomplete="current-password" required><label>رمز جدید</label><input name="new_password" type="password" minlength="12" autocomplete="new-password" required><label>تکرار رمز جدید</label><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required><button>تغییر رمز و خروج سایر نشست‌ها</button></form></div><div class="card"><h2>بکاپ دیتابیس</h2><p class="muted">Snapshot سازگار SQLite؛ شامل فایل‌های حجیم و کلیدهای S3 نیست.</p><form method="post" action="/manage/backups/create"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت بکاپ جدید</button></form>{backup_links}</div></section><section class="card"><h2>اتصال Worker ایران</h2><p class="muted">این توکن را فقط در فایل <code>.env</code> سرور Worker قرار دهید. توکن به اطلاعات S3 دسترسی مستقیم نمی‌دهد.</p><details><summary>نمایش توکن اتصال</summary><p><code>{replication_token}</code></p></details><form method="post" action="/manage/settings/replication-token"><input type="hidden" name="csrf" value="{session.csrf}"><button class="danger">باطل‌کردن و ساخت توکن جدید</button></form></section>'''
+        disk_threshold = html.escape(await self.storage.get_setting("alert_disk_percent", "90"))
+        queue_threshold = html.escape(await self.storage.get_setting("alert_queue_count", "10"))
+        backup_backend = await self.storage.get_setting("offsite_backup_backend", "")
+        backend_options = '<option value="">غیرفعال</option>' + "".join(
+            f'<option value="{html.escape(item.name)}" {"selected" if item.name == backup_backend else ""}>{html.escape(item.name)}</option>'
+            for item in self.manager.backends.values() if item.role in {"primary", "replica"}
+        )
+        last_backup = html.escape(await self.storage.get_setting("last_offsite_backup_status", "هنوز اجرا نشده"))
+        body = f'''<section class="two"><div class="card"><h2>تغییر رمز پنل</h2><form method="post" action="/manage/settings/password"><input type="hidden" name="csrf" value="{session.csrf}"><label>رمز فعلی</label><input name="current_password" type="password" autocomplete="current-password" required><label>رمز جدید</label><input name="new_password" type="password" minlength="12" autocomplete="new-password" required><label>تکرار رمز جدید</label><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required><button>تغییر رمز و خروج سایر نشست‌ها</button></form></div><div class="card"><h2>بکاپ دیتابیس</h2><p class="muted">Snapshot سازگار SQLite؛ شامل فایل‌های حجیم نیست.</p><form method="post" action="/manage/backups/create"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت بکاپ محلی</button></form>{backup_links}</div></section><section class="two"><div class="card"><h2>پایش و هشدار</h2><form method="post" action="/manage/settings/operations"><input type="hidden" name="csrf" value="{session.csrf}"><label>هشدار مصرف دیسک (درصد)</label><input type="number" name="disk_threshold" min="50" max="99" value="{disk_threshold}"><label>هشدار تعداد کارهای صف</label><input type="number" name="queue_threshold" min="1" max="10000" value="{queue_threshold}"><label>مقصد بکاپ روزانه خارج از سرور</label><select name="backup_backend">{backend_options}</select><button>ذخیره تنظیمات عملیاتی</button></form></div><div class="card"><h2>بکاپ خارج از سرور</h2><p class="muted">شامل SQLite و فایل‌های لازم برای بازیابی تنظیمات رمزگذاری‌شده S3 است؛ فایل‌های حجیم داخل آرشیو نیستند.</p><p>آخرین وضعیت: <code>{last_backup}</code></p><form method="post" action="/manage/backups/offsite"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت و ارسال بکاپ اکنون</button></form></div></section><section class="card"><h2>اتصال Worker ایران</h2><p class="muted">این توکن را فقط در فایل <code>.env</code> سرور Worker قرار دهید. توکن به اطلاعات S3 دسترسی مستقیم نمی‌دهد.</p><details><summary>نمایش توکن اتصال</summary><p><code>{replication_token}</code></p></details><form method="post" action="/manage/settings/replication-token"><input type="hidden" name="csrf" value="{session.csrf}"><button class="danger">باطل‌کردن و ساخت توکن جدید</button></form></section>'''
         return self.page(body, "settings", True)
 
     async def change_password(self, request: web.Request) -> web.Response:
@@ -312,6 +324,54 @@ class AdminWeb:
         for old in backups[10:]:
             old.unlink(missing_ok=True)
         raise web.HTTPFound("/manage/settings")
+
+    async def create_offsite_backup_now(self, request: web.Request) -> web.Response:
+        await self.require_form_session(request)
+        backend = await self.storage.get_setting("offsite_backup_backend", "")
+        if not backend or backend not in self.manager.backends:
+            raise web.HTTPBadRequest(text="Offsite backup backend is not configured")
+        await create_offsite_backup(self.storage, self.store, self.manager, backend)
+        await self.storage.add_audit(request.remote or "unknown", "offsite_backup_created", backend)
+        raise web.HTTPFound("/manage/settings")
+
+    async def save_operations_settings(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        try:
+            disk = int(data.get("disk_threshold", "90"))
+            queue = int(data.get("queue_threshold", "10"))
+        except ValueError as exc:
+            raise web.HTTPBadRequest(text="Invalid alert thresholds") from exc
+        backend = data.get("backup_backend", "")
+        if not 50 <= disk <= 99 or not 1 <= queue <= 10000:
+            raise web.HTTPBadRequest(text="Invalid alert thresholds")
+        if backend and backend not in self.manager.backends:
+            raise web.HTTPBadRequest(text="Unknown backup backend")
+        await self.storage.set_setting("alert_disk_percent", str(disk))
+        await self.storage.set_setting("alert_queue_count", str(queue))
+        await self.storage.set_setting("offsite_backup_backend", backend)
+        await self.storage.add_audit(request.remote or "unknown", "operations_settings_changed")
+        raise web.HTTPFound("/manage/settings")
+
+    async def change_file_expiry(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        token = data.get("token", "")
+        action = data.get("action", "")
+        item = await self.storage.get(token)
+        if item is None:
+            raise web.HTTPNotFound(text="File not found")
+        if action == "permanent":
+            expires_at = 4_102_444_800  # 2100-01-01
+        else:
+            try:
+                hours = int(action)
+            except ValueError as exc:
+                raise web.HTTPBadRequest(text="Invalid expiry action") from exc
+            if hours not in {24, 168, 720}:
+                raise web.HTTPBadRequest(text="Invalid expiry action")
+            expires_at = max(int(time.time()), item.expires_at) + hours * 3600
+        await self.storage.update_expiry(token, expires_at)
+        await self.storage.add_audit(request.remote or "unknown", "file_expiry_changed", token)
+        raise web.HTTPFound("/manage/files")
 
     async def download_backup(self, request: web.Request) -> web.StreamResponse:
         if not self.session(request):

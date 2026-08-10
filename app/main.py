@@ -36,6 +36,7 @@ from .config import Settings
 from .admin_web import AdminWeb
 from .download_page import render_download_page, render_expired_page
 from .object_storage import ObjectStorageManager, UploadCancelled
+from .offsite_backup import create_offsite_backup
 from .replication_api import ReplicationAPI
 from .secure_config import EncryptedConfigStore
 from .storage import Storage, StoredFile
@@ -135,6 +136,9 @@ async def create_app(settings: Settings) -> None:
     await storage.ensure_setting("replication_count", "1")
     await storage.ensure_setting("replication_paused", "0")
     await storage.ensure_setting("replication_api_token", secrets.token_urlsafe(32))
+    await storage.ensure_setting("alert_disk_percent", "90")
+    await storage.ensure_setting("alert_queue_count", "10")
+    await storage.ensure_setting("offsite_backup_backend", "")
     await storage.ensure_setting(
         "admin_web_password_hash", settings.admin_web_password_hash or ""
     )
@@ -1107,6 +1111,12 @@ async def create_app(settings: Settings) -> None:
                 for old in backups[7:]:
                     await asyncio.to_thread(old.unlink, missing_ok=True)
                 logger.info("Automatic database backup created: %s", filename)
+                offsite_backend = await storage.get_setting("offsite_backup_backend", "")
+                if offsite_backend:
+                    object_key = await create_offsite_backup(
+                        storage, encrypted_config, object_storage, offsite_backend
+                    )
+                    logger.info("Offsite backup uploaded: %s", object_key)
             except Exception:
                 logger.exception("Automatic database backup failed")
             await asyncio.sleep(24 * 3600)
@@ -1114,10 +1124,15 @@ async def create_app(settings: Settings) -> None:
     async def alert_loop() -> None:
         disk_alerted = False
         storage_alerted = False
+        queue_alerted = False
         while True:
             try:
                 disk = shutil.disk_usage(storage.data_dir)
-                disk_high = disk.used / disk.total >= 0.90
+                disk_threshold = int(await storage.get_setting("alert_disk_percent", "90"))
+                queue_threshold = int(await storage.get_setting("alert_queue_count", "10"))
+                pending_jobs = await storage.pending_replication_count()
+                disk_high = disk.used * 100 / disk.total >= disk_threshold
+                queue_high = pending_jobs >= queue_threshold
                 unhealthy = [
                     item.name for item in object_storage.backends.values()
                     if item.enabled and item.unhealthy_until > time.monotonic()
@@ -1132,8 +1147,14 @@ async def create_app(settings: Settings) -> None:
                         settings.admin_user_id,
                         "⚠️ فضای ذخیره‌سازی ناسالم: " + ", ".join(unhealthy),
                     )
+                if settings.admin_user_id and queue_high and not queue_alerted:
+                    await bot.send_message(
+                        settings.admin_user_id,
+                        f"⚠️ هشدار صف انتقال: {pending_jobs} کار در انتظار است.",
+                    )
                 disk_alerted = disk_high
                 storage_alerted = bool(unhealthy)
+                queue_alerted = queue_high
             except Exception:
                 logger.exception("Operational alert cycle failed")
             await asyncio.sleep(300)

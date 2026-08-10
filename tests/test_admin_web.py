@@ -71,6 +71,55 @@ class AdminWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<script>alert", body)
         self.assertIn("&lt;script&gt;", body)
 
+    async def test_file_expiry_can_be_extended_or_made_permanent(self) -> None:
+        original_expiry = int(time.time()) + 3600
+        await self.storage.add(
+            StoredFile(
+                "expiry-token", "stored", "movie.mkv", "video/x-matroska",
+                10, original_expiry,
+            )
+        )
+        response = await self.client.post(
+            "/manage/files/expiry", headers=self.headers,
+            data={"csrf": "csrf-token", "token": "expiry-token", "action": "24"},
+            allow_redirects=False,
+        )
+        self.assertEqual(response.status, 302)
+        self.assertEqual(
+            (await self.storage.get("expiry-token")).expires_at,
+            original_expiry + 24 * 3600,
+        )
+        response = await self.client.post(
+            "/manage/files/expiry", headers=self.headers,
+            data={"csrf": "csrf-token", "token": "expiry-token", "action": "permanent"},
+            allow_redirects=False,
+        )
+        self.assertEqual(response.status, 302)
+        self.assertEqual((await self.storage.get("expiry-token")).expires_at, 4_102_444_800)
+
+    async def test_operational_alert_settings_are_validated_and_saved(self) -> None:
+        response = await self.client.post(
+            "/manage/settings/operations", headers=self.headers,
+            data={
+                "csrf": "csrf-token", "disk_threshold": "85",
+                "queue_threshold": "25", "backup_backend": "",
+            },
+            allow_redirects=False,
+        )
+        self.assertEqual(response.status, 302)
+        self.assertEqual(await self.storage.get_setting("alert_disk_percent"), "85")
+        self.assertEqual(await self.storage.get_setting("alert_queue_count"), "25")
+
+        rejected = await self.client.post(
+            "/manage/settings/operations", headers=self.headers,
+            data={
+                "csrf": "csrf-token", "disk_threshold": "20",
+                "queue_threshold": "0", "backup_backend": "",
+            },
+            allow_redirects=False,
+        )
+        self.assertEqual(rejected.status, 400)
+
     async def test_storage_sections_are_split_into_separate_pages(self) -> None:
         overview = await self.client.get("/manage/storage", headers=self.headers)
         overview_body = await overview.text()

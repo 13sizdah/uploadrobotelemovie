@@ -48,6 +48,17 @@ class AdminWeb:
         app.router.add_get("/manage/audit", self.audit_page)
         app.router.add_get("/manage/settings", self.settings_page)
         app.router.add_get("/manage/backups/{name}", self.download_backup)
+        for path in (
+            "/manage/storage/add",
+            "/manage/storage/mode",
+            "/manage/storage/replication",
+            "/manage/storage/migrate",
+            "/manage/storage/toggle",
+            "/manage/storage/priority",
+            "/manage/storage/capacity",
+            "/manage/storage/delete",
+        ):
+            app.router.add_get(path, self.redirect_to_storage)
         app.router.add_post("/manage/login", self.login)
         app.router.add_post("/manage/logout", self.logout)
         app.router.add_post("/manage/files/delete", self.delete_file)
@@ -65,6 +76,10 @@ class AdminWeb:
 
     async def redirect_to_index(self, _: web.Request) -> web.Response:
         raise web.HTTPPermanentRedirect("/manage/")
+
+    async def redirect_to_storage(self, _: web.Request) -> web.Response:
+        """Recover cleanly when a POST-only action URL is refreshed or bookmarked."""
+        raise web.HTTPSeeOther("/manage/storage")
 
     def session(self, request: web.Request) -> Session | None:
         token = request.cookies.get("admin_session", "")

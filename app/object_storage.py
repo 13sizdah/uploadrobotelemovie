@@ -13,6 +13,7 @@ from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 
 logger = logging.getLogger(__name__)
+STORAGE_ROLES = {"primary", "replica", "download", "disabled"}
 
 
 class UploadCancelled(RuntimeError):
@@ -29,6 +30,7 @@ class S3Backend:
     secret_access_key: str
     priority: int = 100
     enabled: bool = True
+    role: str = "primary"
     capacity_bytes: int = 0
     reserve_bytes: int = 0
     failures: int = 0
@@ -57,7 +59,12 @@ class ObjectStorageManager:
                 access_key_id=str(item["access_key_id"]),
                 secret_access_key=str(item["secret_access_key"]),
                 priority=int(item.get("priority", 100)),
-                enabled=bool(item.get("enabled", True)),
+                enabled=bool(item.get("enabled", True)) and str(item.get("role", "primary")) != "disabled",
+                role=(
+                    str(item.get("role"))
+                    if str(item.get("role", "")) in STORAGE_ROLES
+                    else ("primary" if bool(item.get("enabled", True)) else "disabled")
+                ),
                 capacity_bytes=max(0, int(item.get("capacity_bytes", 0))),
                 reserve_bytes=max(0, int(item.get("reserve_bytes", 0))),
             )
@@ -78,7 +85,8 @@ class ObjectStorageManager:
                 "name": item.name, "endpoint_url": item.endpoint_url, "bucket": item.bucket,
                 "region": item.region, "access_key_id": item.access_key_id,
                 "secret_access_key": item.secret_access_key, "priority": item.priority,
-                "enabled": item.enabled, "capacity_bytes": item.capacity_bytes,
+                "enabled": item.role != "disabled", "role": item.role,
+                "capacity_bytes": item.capacity_bytes,
                 "reserve_bytes": item.reserve_bytes,
             }
             for item in self.backends.values()
@@ -92,12 +100,14 @@ class ObjectStorageManager:
         self,
         incoming_size: int = 0,
         usage: dict[str, int] | None = None,
+        purpose: str = "primary",
     ) -> list[S3Backend]:
         now = time.monotonic()
         usage = usage or {}
         candidates = []
         for backend in self.backends.values():
-            if not backend.enabled or backend.unhealthy_until > now:
+            allowed_roles = {"primary"} if purpose == "primary" else {"primary", "replica"}
+            if backend.role not in allowed_roles or backend.unhealthy_until > now:
                 continue
             used = usage.get(backend.name, 0)
             if backend.capacity_bytes and used + incoming_size + backend.reserve_bytes > backend.capacity_bytes:
@@ -191,8 +201,8 @@ class ObjectStorageManager:
         content_type: str,
     ) -> None:
         backend = self.backends[backend_name]
-        if not backend.enabled:
-            raise RuntimeError(f"S3 backend is disabled for upload: {backend_name}")
+        if backend.role not in {"primary", "replica"}:
+            raise RuntimeError(f"S3 backend role does not allow upload: {backend_name}")
         await asyncio.to_thread(
             backend.client().upload_file,
             str(source), backend.bucket, object_key,
@@ -209,7 +219,7 @@ class ObjectStorageManager:
     ) -> list[str]:
         return [
             item.name
-            for item in self._candidates(incoming_size, usage)
+            for item in self._candidates(incoming_size, usage, purpose="replica")
             if item.name != primary_backend
         ][: max(0, desired_total - 1)]
 
@@ -258,7 +268,7 @@ class ObjectStorageManager:
         now = time.monotonic()
         for backend_name, object_key in locations:
             backend = self.backends.get(backend_name)
-            if backend and backend.enabled and backend.unhealthy_until <= now:
+            if backend and backend.role != "disabled" and backend.unhealthy_until <= now:
                 available.append((backend.failures * 1000 + backend.priority, backend.latency_ms, backend_name, object_key))
         if not available:
             return locations[0] if locations else None
@@ -301,10 +311,11 @@ class ObjectStorageManager:
             backend = self.backends.get(location[0])
             if backend is None:
                 return (3, float("inf"), float("inf"))
-            availability = 0 if backend.enabled and backend.unhealthy_until <= now else 1
+            availability = 0 if backend.role != "disabled" and backend.unhealthy_until <= now else 1
             return (availability, backend.failures * 1000 + backend.priority, backend.latency_ms)
 
-        for backend_name, object_key in sorted(unique_locations, key=rank):
+        downloadable = [location for location in unique_locations if self.backends.get(location[0]) and self.backends[location[0]].role != "disabled"]
+        for backend_name, object_key in sorted(downloadable, key=rank):
             if await self.object_exists(backend_name, object_key):
                 return backend_name, object_key
         return None

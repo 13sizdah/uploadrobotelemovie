@@ -13,8 +13,9 @@ def config(
     enabled: bool = True,
     capacity_bytes: int = 0,
     reserve_bytes: int = 0,
+    role: str | None = None,
 ) -> dict[str, object]:
-    return {
+    result = {
         "name": name,
         "endpoint_url": "https://s3.example.com",
         "bucket": "files",
@@ -26,9 +27,25 @@ def config(
         "capacity_bytes": capacity_bytes,
         "reserve_bytes": reserve_bytes,
     }
+    if role:
+        result["role"] = role
+    return result
 
 
 class ObjectStorageTests(unittest.IsolatedAsyncioTestCase):
+    def test_storage_roles_control_primary_and_replication_routing(self) -> None:
+        manager = ObjectStorageManager(
+            (
+                config("main", 1, role="primary"),
+                config("iran", 2, role="replica"),
+                config("archive", 3, role="download"),
+                config("off", 4, role="disabled"),
+            ), 8, 300,
+        )
+
+        self.assertEqual([item.name for item in manager._candidates()], ["main"])
+        self.assertEqual(manager.replication_targets("main", 3, 10), ["iran"])
+
     async def test_user_cancellation_does_not_mark_backend_unhealthy(self) -> None:
         manager = ObjectStorageManager((config("primary", 1),), 8, 300)
         backend = manager.backends["primary"]

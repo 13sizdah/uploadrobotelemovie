@@ -57,6 +57,7 @@ class AdminWeb:
             "/manage/storage/replication",
             "/manage/storage/migrate",
             "/manage/storage/toggle",
+            "/manage/storage/role",
             "/manage/storage/priority",
             "/manage/storage/capacity",
             "/manage/storage/delete",
@@ -74,6 +75,7 @@ class AdminWeb:
         app.router.add_post("/manage/storage/replication", self.set_replication)
         app.router.add_post("/manage/storage/migrate", self.start_migration)
         app.router.add_post("/manage/storage/toggle", self.toggle_storage)
+        app.router.add_post("/manage/storage/role", self.set_storage_role)
         app.router.add_post("/manage/storage/priority", self.set_storage_priority)
         app.router.add_post("/manage/storage/capacity", self.set_storage_capacity)
         app.router.add_post("/manage/storage/delete", self.delete_storage)
@@ -152,10 +154,15 @@ class AdminWeb:
             used_gb = usage / (1024 ** 3)
             capacity_gb = item.capacity_bytes / (1024 ** 3) if item.capacity_bytes else 0
             healthy = item.unhealthy_until <= time.monotonic()
-            state_class = "ok" if item.enabled and healthy else "bad"
-            state = "فعال و سالم" if item.enabled and healthy else ("غیرفعال برای آپلود" if not item.enabled else "موقتاً ناسالم")
+            role_labels = {"primary": "Primary", "replica": "Replica Only", "download": "Download Only", "disabled": "Disabled"}
+            state_class = "ok" if item.role != "disabled" and healthy else "bad"
+            state = f'{role_labels[item.role]} • ' + ("سالم" if healthy else "موقتاً ناسالم")
+            role_options = "".join(
+                f'<option value="{value}" {"selected" if item.role == value else ""}>{label}</option>'
+                for value, label in role_labels.items()
+            )
             cards_parts.append(
-                f'''<section class="card"><h2>{name}</h2><p>Bucket: <b>{html.escape(item.bucket)}</b></p><p>Endpoint: {html.escape(item.endpoint_url)}</p><p>Region: {html.escape(item.region)}</p><p>مصرف ثبت‌شده: {used_gb:.2f} GB از {'نامحدود' if not capacity_gb else f'{capacity_gb:.2f} GB'}</p><p>Latency: {item.latency_ms:.0f} ms | خطا: {item.failures} | ارجاع فایل: {refs}</p><p class="{state_class}">{state}</p><form method="post" action="/manage/storage/capacity"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><div class="row"><div><label>ظرفیت قابل استفاده (GB، صفر=نامحدود)</label><input name="capacity_gb" type="number" value="{capacity_gb:.2f}" min="0" step="0.1"></div><div><label>فضای رزرو (GB)</label><input name="reserve_gb" type="number" value="{item.reserve_bytes / (1024 ** 3):.2f}" min="0" step="0.1"></div></div><button>ذخیره ظرفیت</button></form><div class="row"><form method="post" action="/manage/storage/priority"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><label>اولویت</label><input name="priority" type="number" value="{item.priority}" min="1" max="9999"><button>ذخیره اولویت</button></form><form method="post" action="/manage/storage/toggle"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><button>{'غیرفعال‌کردن آپلود' if item.enabled else 'فعال‌کردن آپلود'}</button></form></div><form method="post" action="/manage/storage/delete"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><button class="danger">حذف تنظیمات این فضا</button></form></section>'''
+                f'''<section class="card"><h2>{name}</h2><p>Bucket: <b>{html.escape(item.bucket)}</b></p><p>Endpoint: {html.escape(item.endpoint_url)}</p><p>Region: {html.escape(item.region)}</p><p>مصرف ثبت‌شده: {used_gb:.2f} GB از {'نامحدود' if not capacity_gb else f'{capacity_gb:.2f} GB'}</p><p>Latency: {item.latency_ms:.0f} ms | خطا: {item.failures} | ارجاع فایل: {refs}</p><p class="{state_class}">{state}</p><form method="post" action="/manage/storage/role"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><label>نقش فضا</label><select name="role">{role_options}</select><button>ذخیره نقش</button></form><form method="post" action="/manage/storage/capacity"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><div class="row"><div><label>ظرفیت قابل استفاده (GB، صفر=نامحدود)</label><input name="capacity_gb" type="number" value="{capacity_gb:.2f}" min="0" step="0.1"></div><div><label>فضای رزرو (GB)</label><input name="reserve_gb" type="number" value="{item.reserve_bytes / (1024 ** 3):.2f}" min="0" step="0.1"></div></div><button>ذخیره ظرفیت</button></form><form method="post" action="/manage/storage/priority"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><label>اولویت</label><input name="priority" type="number" value="{item.priority}" min="1" max="9999"><button>ذخیره اولویت</button></form><form method="post" action="/manage/storage/delete"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><button class="danger">حذف تنظیمات این فضا</button></form></section>'''
             )
         cards = (
             f'<section class="card"><p>کارهای replication در صف: <b>{pending_replications}</b></p></section>'
@@ -402,7 +409,7 @@ class AdminWeb:
             "bucket": data.get("bucket", ""), "region": data.get("region", "auto"),
             "access_key_id": data.get("access_key_id", ""),
             "secret_access_key": data.get("secret_access_key", ""),
-            "priority": priority, "enabled": True,
+            "priority": priority, "enabled": True, "role": "primary",
             "capacity_bytes": int(capacity_gb * 1024 ** 3),
             "reserve_bytes": int(reserve_gb * 1024 ** 3),
         }
@@ -449,9 +456,28 @@ class AdminWeb:
         configs = self.manager.export_configs()
         for config in configs:
             if config["name"] == name:
-                config["enabled"] = not bool(config.get("enabled", True))
+                config["role"] = "disabled" if config.get("role", "primary") != "disabled" else "primary"
+                config["enabled"] = config["role"] != "disabled"
         await self._save_backend_configs(configs)
         if not any(item.enabled for item in self.manager.backends.values()):
+            await self.storage.set_setting("storage_backend", "local")
+        raise web.HTTPFound("/manage/storage")
+
+    async def set_storage_role(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        name = data.get("name", "")
+        role = data.get("role", "")
+        if name not in self.manager.backends:
+            raise web.HTTPNotFound(text="Storage backend not found")
+        if role not in {"primary", "replica", "download", "disabled"}:
+            raise web.HTTPBadRequest(text="Invalid storage role")
+        configs = self.manager.export_configs()
+        for config in configs:
+            if config["name"] == name:
+                config["role"] = role
+                config["enabled"] = role != "disabled"
+        await self._save_backend_configs(configs)
+        if not any(item.role == "primary" for item in self.manager.backends.values()):
             await self.storage.set_setting("storage_backend", "local")
         raise web.HTTPFound("/manage/storage")
 

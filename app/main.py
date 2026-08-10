@@ -40,6 +40,7 @@ from .offsite_backup import create_offsite_backup
 from .replication_api import ReplicationAPI
 from .secure_config import EncryptedConfigStore
 from .storage import Storage, StoredFile
+from .telegram_cache import validated_cache_path
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
@@ -226,7 +227,8 @@ async def create_app(settings: Settings) -> None:
         status: Message,
         expected_size: int | None,
         cancelled: threading.Event,
-    ) -> int:
+        zero_copy_s3: bool = False,
+    ) -> tuple[int, Path | None]:
         preparing_started = time.monotonic()
 
         async def preparation_updates() -> None:
@@ -262,10 +264,21 @@ async def create_app(settings: Settings) -> None:
 
         total = expected_size or telegram_file.file_size or 0
         source_path: Path | None = None
-        if settings.telegram_api_base and Path(telegram_file.file_path).is_absolute():
-            source_path = Path(telegram_file.file_path)
+        source_path = validated_cache_path(
+            telegram_file.file_path, bool(settings.telegram_api_base)
+        )
+        if source_path is not None:
             if not total:
                 total = source_path.stat().st_size
+
+        # Local Bot API has already materialized the complete file. For S3 mode,
+        # return that safe cache path and let boto3 read it directly instead of
+        # creating a second multi-gigabyte copy under data/files.
+        if zero_copy_s3 and source_path is not None:
+            actual_size = source_path.stat().st_size
+            if cancelled.is_set():
+                raise UploadCancelled("Upload cancelled by user")
+            return actual_size, source_path
 
         received = 0
         started_at = time.monotonic()
@@ -301,9 +314,7 @@ async def create_app(settings: Settings) -> None:
                     # Local Bot API keeps a second multi-GB copy indefinitely.
                     # Only unlink paths inside its dedicated cache mount; Telegram
                     # can download the file again later from the original file_id.
-                    cache_root = Path("/var/lib/telegram-bot-api")
-                    with suppress(OSError, ValueError):
-                        source_path.resolve().relative_to(cache_root)
+                    if validated_cache_path(str(source_path), True) is not None:
                         await asyncio.to_thread(source_path.unlink, missing_ok=True)
             else:
                 file_base = (settings.telegram_file_base or "https://api.telegram.org").rstrip("/")
@@ -319,7 +330,7 @@ async def create_app(settings: Settings) -> None:
                             received += len(chunk)
                             await update_progress()
         await update_progress(force=True)
-        return received
+        return received, None
 
     def is_allowed(message: Message) -> bool:
         if message.from_user and message.from_user.id == settings.admin_user_id:
@@ -656,23 +667,32 @@ async def create_app(settings: Settings) -> None:
         object_key: str | None = None
         replication_targets: list[tuple[str, str]] = []
         record_saved = False
+        telegram_cache_source: Path | None = None
         try:
-            actual_size = await download_with_progress(
+            storage_mode = await storage.get_setting("storage_backend", settings.storage_backend)
+            actual_size, telegram_cache_source = await download_with_progress(
                 media.downloadable,
                 destination,
                 status,
                 media.file_size,
                 cancelled,
+                zero_copy_s3=storage_mode == "s3",
             )
-            await status.edit_text(
-                "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…"
-            )
+            if telegram_cache_source is not None:
+                await status.edit_text(
+                    "مرحله ۱ از ۳ — فایل در cache تلگرام آماده شد\n"
+                    "مرحله ۲ — شروع انتقال مستقیم به فضای ابری…"
+                )
+            else:
+                await status.edit_text(
+                    "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…"
+                )
             if max_bytes and actual_size > max_bytes:
                 await storage.delete_stored_file(stored_name)
                 await status.edit_text("❌ حجم فایل از محدودیت مجاز بیشتر است.")
                 return
             backend_name = "local"
-            if await storage.get_setting("storage_backend", settings.storage_backend) == "s3":
+            if storage_mode == "s3":
                 if object_storage is None:
                     raise RuntimeError("S3 enabled without configured backends")
                 object_key = f"files/{int(time.time())}/{token}/{stored_name}"
@@ -690,7 +710,9 @@ async def create_app(settings: Settings) -> None:
                         filled = min(int(percent / 10), 10)
                         try:
                             await status.edit_text(
-                                "مرحله ۳ از ۴ — انتقال به فضای ابری\n\n"
+                                ("مرحله ۲ از ۳ — انتقال مستقیم cache به فضای ابری\n\n"
+                                 if telegram_cache_source is not None else
+                                 "مرحله ۳ از ۴ — انتقال به فضای ابری\n\n") +
                                 f"{'▓' * filled}{'░' * (10 - filled)}  {percent:.1f}%\n"
                                 f"ارسال‌شده: {human_size(cloud_uploaded)} از {human_size(actual_size)}\n"
                                 f"سرعت: {human_size(int(cloud_uploaded / elapsed))}/s"
@@ -702,8 +724,9 @@ async def create_app(settings: Settings) -> None:
                 cloud_task = asyncio.create_task(cloud_progress_updates())
                 try:
                     backend_usage = await storage.backend_usage()
+                    upload_source = telegram_cache_source or destination
                     backend_name = await object_storage.upload(
-                        destination, object_key, media.mime_type, cloud_progress,
+                        upload_source, object_key, media.mime_type, cloud_progress,
                         backend_usage, cancelled.is_set,
                     )
                     uploaded_backend = backend_name
@@ -712,7 +735,9 @@ async def create_app(settings: Settings) -> None:
                     with suppress(asyncio.CancelledError):
                         await cloud_task
                 await status.edit_text(
-                    f"مرحله ۴ از ۴ — انتقال ابری کامل شد\nفضای انتخاب‌شده: {backend_name}"
+                    (f"مرحله ۳ از ۳ — انتقال مستقیم کامل شد\nفضای انتخاب‌شده: {backend_name}"
+                     if telegram_cache_source is not None else
+                     f"مرحله ۴ از ۴ — انتقال ابری کامل شد\nفضای انتخاب‌شده: {backend_name}")
                 )
                 replication_count = max(
                     1, int(await storage.get_setting("replication_count", "1"))
@@ -763,6 +788,10 @@ async def create_app(settings: Settings) -> None:
                     await object_storage.delete(uploaded_backend, object_key)
             await status.edit_text("❌ دریافت فایل ناموفق بود. لطفاً دوباره تلاش کنید.")
             return
+        finally:
+            if telegram_cache_source is not None:
+                if validated_cache_path(str(telegram_cache_source), True) is not None:
+                    await asyncio.to_thread(telegram_cache_source.unlink, missing_ok=True)
 
         link = f"{settings.public_base_url}/d/{token}"
         expiry = datetime.fromtimestamp(expires_at).astimezone().strftime("%Y-%m-%d %H:%M")

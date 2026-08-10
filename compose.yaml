@@ -6,7 +6,7 @@ services:
     volumes:
       - ./data:/app/data
       # Local Bot API returns absolute paths; both containers must see this path.
-      # The app removes each Local Bot API cache file after safely copying it.
+      # In S3 mode the app uploads directly from this cache (zero-copy), then removes it.
       - telegram-bot-api-data:/var/lib/telegram-bot-api
     ports:
       - "127.0.0.1:8080:8080"

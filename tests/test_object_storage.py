@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock
 
-from app.object_storage import ObjectStorageManager
+from app.object_storage import ObjectStorageManager, UploadCancelled
 
 
 def config(
@@ -28,6 +29,22 @@ def config(
 
 
 class ObjectStorageTests(unittest.IsolatedAsyncioTestCase):
+    async def test_user_cancellation_does_not_mark_backend_unhealthy(self) -> None:
+        manager = ObjectStorageManager((config("primary", 1),), 8, 300)
+        backend = manager.backends["primary"]
+
+        class FakeClient:
+            def upload_file(self, *args, **kwargs):
+                kwargs["Callback"](1024)
+
+        backend.client = lambda: FakeClient()  # type: ignore[method-assign]
+        with self.assertRaises(UploadCancelled):
+            await manager.upload(
+                Path(__file__), "files/test", "application/octet-stream",
+                cancelled=lambda: True,
+            )
+        self.assertEqual(backend.failures, 0)
+
     def test_capacity_routing_skips_backend_without_room(self) -> None:
         manager = ObjectStorageManager(
             (

@@ -15,6 +15,10 @@ from botocore.config import Config
 logger = logging.getLogger(__name__)
 
 
+class UploadCancelled(RuntimeError):
+    """Raised from a transfer callback to stop and abort an S3 upload."""
+
+
 @dataclass
 class S3Backend:
     name: str
@@ -138,6 +142,7 @@ class ObjectStorageManager:
         content_type: str,
         progress: Callable[[int], None] | None = None,
         usage: dict[str, int] | None = None,
+        cancelled: Callable[[], bool] | None = None,
     ) -> str:
         errors: list[str] = []
         incoming_size = source.stat().st_size
@@ -150,6 +155,8 @@ class ObjectStorageManager:
 
             def callback(amount: int) -> None:
                 nonlocal transferred
+                if cancelled and cancelled():
+                    raise UploadCancelled("Upload cancelled by user")
                 with lock:
                     transferred += amount
                     if progress:
@@ -165,6 +172,10 @@ class ObjectStorageManager:
                 )
                 backend.failures = 0
                 return backend.name
+            except UploadCancelled:
+                # boto3 aborts an in-progress multipart upload when its callback
+                # raises. Do not mark a healthy backend as failed for a user abort.
+                raise
             except Exception as exc:
                 backend.failures += 1
                 backend.unhealthy_until = time.monotonic() + min(300, 15 * 2 ** backend.failures)

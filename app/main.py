@@ -5,6 +5,7 @@ import logging
 import mimetypes
 import secrets
 import shutil
+import threading
 import time
 from contextlib import suppress
 from dataclasses import dataclass
@@ -34,7 +35,7 @@ from aiogram.utils.markdown import hbold, hcode, hlink
 from .config import Settings
 from .admin_web import AdminWeb
 from .download_page import render_download_page, render_expired_page
-from .object_storage import ObjectStorageManager
+from .object_storage import ObjectStorageManager, UploadCancelled
 from .secure_config import EncryptedConfigStore
 from .storage import Storage, StoredFile
 
@@ -131,6 +132,7 @@ async def create_app(settings: Settings) -> None:
     await storage.ensure_setting("forward_only", "1" if settings.forward_only else "0")
     await storage.ensure_setting("storage_backend", settings.storage_backend)
     await storage.ensure_setting("replication_count", "1")
+    await storage.ensure_setting("replication_paused", "0")
     await storage.ensure_setting(
         "admin_web_password_hash", settings.admin_web_password_hash or ""
     )
@@ -164,6 +166,7 @@ async def create_app(settings: Settings) -> None:
     router = Router()
     admins_adding_source: set[int] = set()
     pending_uploads: dict[str, PendingUpload] = {}
+    active_uploads: dict[str, tuple[int, threading.Event]] = {}
     bot_started_at = time.monotonic()
 
     async def delete_stored_item(item: StoredFile) -> bool:
@@ -216,6 +219,7 @@ async def create_app(settings: Settings) -> None:
         destination: Path,
         status: Message,
         expected_size: int | None,
+        cancelled: threading.Event,
     ) -> int:
         preparing_started = time.monotonic()
 
@@ -247,6 +251,8 @@ async def create_app(settings: Settings) -> None:
                 await preparation_task
         if not telegram_file.file_path:
             raise RuntimeError("Telegram did not return a file path")
+        if cancelled.is_set():
+            raise UploadCancelled("Upload cancelled by user")
 
         total = expected_size or telegram_file.file_size or 0
         source_path: Path | None = None
@@ -279,6 +285,8 @@ async def create_app(settings: Settings) -> None:
             if source_path is not None:
                 async with aiofiles.open(source_path, "rb") as source:
                     while chunk := await source.read(1024 * 1024):
+                        if cancelled.is_set():
+                            raise UploadCancelled("Upload cancelled by user")
                         await target.write(chunk)
                         received += len(chunk)
                         await update_progress()
@@ -290,6 +298,8 @@ async def create_app(settings: Settings) -> None:
                     async with client.get(url) as response:
                         response.raise_for_status()
                         async for chunk in response.content.iter_chunked(1024 * 1024):
+                            if cancelled.is_set():
+                                raise UploadCancelled("Upload cancelled by user")
                             await target.write(chunk)
                             received += len(chunk)
                             await update_progress()
@@ -621,6 +631,7 @@ async def create_app(settings: Settings) -> None:
         media: IncomingFile,
         status: Message,
         max_bytes: int,
+        cancelled: threading.Event,
     ) -> None:
         token = secrets.token_urlsafe(32)
         stored_name = secrets.token_hex(16)
@@ -636,6 +647,7 @@ async def create_app(settings: Settings) -> None:
                 destination,
                 status,
                 media.file_size,
+                cancelled,
             )
             await status.edit_text(
                 "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…"
@@ -676,7 +688,8 @@ async def create_app(settings: Settings) -> None:
                 try:
                     backend_usage = await storage.backend_usage()
                     backend_name = await object_storage.upload(
-                        destination, object_key, media.mime_type, cloud_progress, backend_usage
+                        destination, object_key, media.mime_type, cloud_progress,
+                        backend_usage, cancelled.is_set,
                     )
                     uploaded_backend = backend_name
                 finally:
@@ -720,6 +733,13 @@ async def create_app(settings: Settings) -> None:
                 if not replication_targets:
                     await storage.delete_stored_file(stored_name)
             record_saved = True
+        except UploadCancelled:
+            await storage.delete_stored_file(stored_name)
+            if not record_saved and uploaded_backend and object_key:
+                with suppress(Exception):
+                    await object_storage.delete(uploaded_backend, object_key)
+            await status.edit_text("⛔️ آپلود لغو شد و فایل موقت پاک‌سازی شد.")
+            return
         except Exception:
             logger.exception("Could not save Telegram file")
             await storage.delete_stored_file(stored_name)
@@ -761,15 +781,40 @@ async def create_app(settings: Settings) -> None:
             await callback.answer("فقط ارسال‌کننده فایل می‌تواند تصمیم بگیرد", show_alert=True)
             return
         pending_uploads.pop(nonce, None)
+        cancelled = threading.Event()
+        active_uploads[nonce] = (pending.requester_id, cancelled)
         await callback.answer("آپلود آغاز شد")
         if not callback.message:
             return
-        await callback.message.edit_text("مرحله ۱ از ۳ — بررسی فایل و آماده‌سازی انتقال…")
-        await perform_upload(
-            pending.media,
-            callback.message,
-            pending.max_bytes,
+        abort_keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="⛔️ لغو آپلود", callback_data=f"upload:abort:{nonce}")
+        ]])
+        await callback.message.edit_text(
+            "مرحله ۱ از ۳ — بررسی فایل و آماده‌سازی انتقال…",
+            reply_markup=abort_keyboard,
         )
+        try:
+            await perform_upload(
+                pending.media, callback.message, pending.max_bytes, cancelled
+            )
+        finally:
+            active_uploads.pop(nonce, None)
+
+    @router.callback_query(F.data.startswith("upload:abort:"))
+    async def abort_active_upload(callback: CallbackQuery) -> None:
+        nonce = (callback.data or "").removeprefix("upload:abort:")
+        active = active_uploads.get(nonce)
+        if active is None:
+            await callback.answer("این آپلود دیگر فعال نیست", show_alert=True)
+            return
+        requester_id, cancelled = active
+        if callback.from_user.id != requester_id and not is_admin(callback.from_user.id):
+            await callback.answer("فقط ارسال‌کننده یا مدیر می‌تواند لغو کند", show_alert=True)
+            return
+        cancelled.set()
+        await callback.answer("درخواست لغو ثبت شد", show_alert=True)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
 
     @router.callback_query(F.data.startswith("upload:cancel:"))
     async def cancel_upload(callback: CallbackQuery) -> None:
@@ -995,6 +1040,9 @@ async def create_app(settings: Settings) -> None:
     async def replication_loop() -> None:
         while True:
             try:
+                if await storage.get_setting("replication_paused", "0") == "1":
+                    await asyncio.sleep(5)
+                    continue
                 jobs = await storage.due_replication_jobs(limit=5)
                 if not jobs:
                     await asyncio.sleep(5)

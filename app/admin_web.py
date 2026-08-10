@@ -48,6 +48,7 @@ class AdminWeb:
         app.router.add_get("/manage/audit", self.audit_page)
         app.router.add_get("/manage/settings", self.settings_page)
         app.router.add_get("/manage/backups/{name}", self.download_backup)
+        app.router.add_get("/manage/jobs/pause", self.redirect_to_jobs)
         for path in (
             "/manage/storage/add",
             "/manage/storage/mode",
@@ -63,6 +64,7 @@ class AdminWeb:
         app.router.add_post("/manage/logout", self.logout)
         app.router.add_post("/manage/files/delete", self.delete_file)
         app.router.add_post("/manage/jobs/retry", self.retry_jobs)
+        app.router.add_post("/manage/jobs/pause", self.toggle_replication_pause)
         app.router.add_post("/manage/settings/password", self.change_password)
         app.router.add_post("/manage/backups/create", self.create_backup)
         app.router.add_post("/manage/storage/add", self.add_storage)
@@ -80,6 +82,9 @@ class AdminWeb:
     async def redirect_to_storage(self, _: web.Request) -> web.Response:
         """Recover cleanly when a POST-only action URL is refreshed or bookmarked."""
         raise web.HTTPSeeOther("/manage/storage")
+
+    async def redirect_to_jobs(self, _: web.Request) -> web.Response:
+        raise web.HTTPSeeOther("/manage/jobs")
 
     def session(self, request: web.Request) -> Session | None:
         token = request.cookies.get("admin_session", "")
@@ -171,12 +176,15 @@ class AdminWeb:
         session = self.session(request)
         if not session:
             raise web.HTTPFound("/manage/")
+        paused = await self.storage.get_setting("replication_paused", "0") == "1"
         rows = []
         for job in await self.storage.admin_replication_jobs():
             retry = datetime.fromtimestamp(job.next_attempt_at).astimezone().strftime("%Y-%m-%d %H:%M:%S") if job.next_attempt_at else "اکنون"
             rows.append(f'''<tr><td>{job.id}</td><td>{html.escape(job.original_name)}</td><td>{html.escape(job.target_backend)}</td><td>{job.attempts}</td><td>{retry}</td><td>{html.escape(job.last_error or "—")}</td></tr>''')
         table = "".join(rows) or '<tr><td colspan="6" class="muted">صف خالی است.</td></tr>'
-        return self.page(f'''<section class="card"><h2>صف انتقال پایدار</h2><p class="muted">کارهای ناموفق بعد از restart باقی می‌مانند و با فاصله افزایشی دوباره اجرا می‌شوند.</p><form method="post" action="/manage/jobs/retry"><input type="hidden" name="csrf" value="{session.csrf}"><button>اجرای دوباره همه کارها</button></form><div class="table-wrap"><table><thead><tr><th>ID</th><th>فایل</th><th>مقصد</th><th>تلاش</th><th>اجرای بعد</th><th>آخرین خطا</th></tr></thead><tbody>{table}</tbody></table></div></section>''', "jobs", True)
+        state = "متوقف" if paused else "در حال اجرا"
+        action = "ادامه صف" if paused else "توقف صف"
+        return self.page(f'''<section class="card"><h2>صف انتقال پایدار</h2><p>وضعیت: <b>{state}</b></p><p class="muted">کارهای ناموفق بعد از restart باقی می‌مانند و با فاصله افزایشی دوباره اجرا می‌شوند.</p><div class="row"><form method="post" action="/manage/jobs/pause"><input type="hidden" name="csrf" value="{session.csrf}"><button class="secondary">{action}</button></form><form method="post" action="/manage/jobs/retry"><input type="hidden" name="csrf" value="{session.csrf}"><button>اجرای دوباره همه کارها</button></form></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>فایل</th><th>مقصد</th><th>تلاش</th><th>اجرای بعد</th><th>آخرین خطا</th></tr></thead><tbody>{table}</tbody></table></div></section>''', "jobs", True)
 
     async def system_page(self, request: web.Request) -> web.Response:
         session = self.session(request)
@@ -277,6 +285,12 @@ class AdminWeb:
     async def retry_jobs(self, request: web.Request) -> web.Response:
         await self.require_form_session(request)
         await self.storage.retry_replication_jobs()
+        raise web.HTTPFound("/manage/jobs")
+
+    async def toggle_replication_pause(self, request: web.Request) -> web.Response:
+        await self.require_form_session(request)
+        paused = await self.storage.get_setting("replication_paused", "0") == "1"
+        await self.storage.set_setting("replication_paused", "0" if paused else "1")
         raise web.HTTPFound("/manage/jobs")
 
     @staticmethod

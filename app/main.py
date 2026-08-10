@@ -11,17 +11,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
+import aiofiles
+import aiohttp
 from aiohttp import web
 from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.filters import Command, CommandStart
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    MessageOriginChannel,
+    MessageOriginUser,
+)
 from aiogram.utils.markdown import hbold, hcode, hlink
 
 from .config import Settings
-from .download_page import render_download_page
+from .download_page import render_download_page, render_expired_page
 from .storage import Storage, StoredFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -71,6 +80,17 @@ def incoming_file(message: Message) -> IncomingFile | None:
     return None
 
 
+def forward_source(message: Message) -> tuple[int, str, str] | None:
+    origin = message.forward_origin
+    if isinstance(origin, MessageOriginChannel):
+        return origin.chat.id, origin.chat.title or str(origin.chat.id), "کانال"
+    if isinstance(origin, MessageOriginUser) and origin.sender_user.is_bot:
+        bot = origin.sender_user
+        title = f"@{bot.username}" if bot.username else bot.full_name or str(bot.id)
+        return bot.id, title, "ربات"
+    return None
+
+
 def safe_filename(name: str | None) -> str:
     value = Path(name or "file").name.replace("\x00", "")
     return value[:240] or "file"
@@ -95,6 +115,7 @@ def human_size(size: int) -> str:
 async def create_app(settings: Settings) -> None:
     storage = Storage(settings.data_dir)
     await storage.initialize()
+    await storage.ensure_setting("forward_only", "1" if settings.forward_only else "0")
 
     if settings.telegram_api_base:
         api_server = TelegramAPIServer.from_base(
@@ -113,11 +134,201 @@ async def create_app(settings: Settings) -> None:
     bot = Bot(token=settings.bot_token, session=session)
     dispatcher = Dispatcher()
     router = Router()
+    admins_adding_source: set[int] = set()
+
+    def progress_text(received: int, total: int, started_at: float) -> str:
+        elapsed = max(time.monotonic() - started_at, 0.001)
+        speed = received / elapsed
+        if total > 0:
+            percent = min(received * 100 / total, 100)
+            filled = min(int(percent / 10), 10)
+            bar = "▓" * filled + "░" * (10 - filled)
+            amount = f"{human_size(received)} از {human_size(total)}"
+            percent_line = f"{percent:.1f}%"
+        else:
+            bar = "▓░░░░░░░░░"
+            amount = human_size(received)
+            percent_line = "حجم کل نامشخص"
+        return (
+            "مرحله ۲ از ۳ — انتقال فایل به سرور\n\n"
+            f"{bar}  {percent_line}\n"
+            f"دریافت‌شده: {amount}\n"
+            f"سرعت: {human_size(int(speed))}/s"
+        )
+
+    async def download_with_progress(
+        downloadable: Any,
+        destination: Path,
+        status: Message,
+        expected_size: int | None,
+    ) -> int:
+        telegram_file = await bot.get_file(downloadable.file_id)
+        if not telegram_file.file_path:
+            raise RuntimeError("Telegram did not return a file path")
+
+        total = expected_size or telegram_file.file_size or 0
+        source_path: Path | None = None
+        if settings.telegram_api_base and Path(telegram_file.file_path).is_absolute():
+            source_path = Path(telegram_file.file_path)
+            if not total:
+                total = source_path.stat().st_size
+
+        received = 0
+        started_at = time.monotonic()
+        last_update = started_at
+        last_percent = -1
+
+        async def update_progress(force: bool = False) -> None:
+            nonlocal last_update, last_percent
+            now = time.monotonic()
+            current_percent = int(received * 100 / total) if total else -1
+            if not force and (now - last_update < 3 or current_percent == last_percent):
+                return
+            try:
+                await status.edit_text(progress_text(received, total, started_at))
+                last_update = now
+                last_percent = current_percent
+            except Exception as exc:
+                # Progress reporting must never interrupt a multi-gigabyte transfer.
+                logger.debug("Could not update progress message: %s", exc)
+
+        await update_progress(force=True)
+        async with aiofiles.open(destination, "wb") as target:
+            if source_path is not None:
+                async with aiofiles.open(source_path, "rb") as source:
+                    while chunk := await source.read(1024 * 1024):
+                        await target.write(chunk)
+                        received += len(chunk)
+                        await update_progress()
+            else:
+                file_base = (settings.telegram_file_base or "https://api.telegram.org").rstrip("/")
+                url = f"{file_base}/file/bot{settings.bot_token}/{telegram_file.file_path}"
+                timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
+                async with aiohttp.ClientSession(timeout=timeout) as client:
+                    async with client.get(url) as response:
+                        response.raise_for_status()
+                        async for chunk in response.content.iter_chunked(1024 * 1024):
+                            await target.write(chunk)
+                            received += len(chunk)
+                            await update_progress()
+        await update_progress(force=True)
+        return received
 
     def is_allowed(message: Message) -> bool:
+        if message.from_user and message.from_user.id == settings.admin_user_id:
+            return True
         return not settings.allowed_user_ids or bool(
             message.from_user and message.from_user.id in settings.allowed_user_ids
         )
+
+    def is_admin(user_id: int | None) -> bool:
+        return bool(settings.admin_user_id and user_id == settings.admin_user_id)
+
+    async def forward_only_enabled() -> bool:
+        return await storage.get_setting("forward_only", "0") == "1"
+
+    def admin_keyboard(forward_only: bool) -> InlineKeyboardMarkup:
+        toggle_text = (
+            "غیرفعال‌کردن محدودیت فوروارد"
+            if forward_only
+            else "فعال‌کردن محدودیت فوروارد"
+        )
+        return InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=toggle_text, callback_data="admin:toggle_forward")],
+                [InlineKeyboardButton(text="افزودن مبدأ مجاز", callback_data="admin:add_source")],
+                [InlineKeyboardButton(text="مدیریت منابع", callback_data="admin:list_sources")],
+                [InlineKeyboardButton(text="راهنما", callback_data="admin:help")],
+            ]
+        )
+
+    @router.message(Command("admin"))
+    async def admin_panel(message: Message) -> None:
+        if not is_admin(message.from_user.id if message.from_user else None):
+            await message.answer("⛔️ دسترسی به پنل مدیریت ندارید.")
+            return
+        current_mode = await forward_only_enabled()
+        mode = "فعال" if current_mode else "غیرفعال"
+        await message.answer(
+            f"پنل مدیریت ربات\n\nحالت پذیرش فقط از منابع مجاز: {mode}",
+            reply_markup=admin_keyboard(current_mode),
+        )
+
+    @router.callback_query(F.data == "admin:toggle_forward")
+    async def admin_toggle_forward(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        enabled = not await forward_only_enabled()
+        await storage.set_setting("forward_only", "1" if enabled else "0")
+        mode = "فعال شد" if enabled else "غیرفعال شد"
+        await callback.answer(f"محدودیت {mode}", show_alert=True)
+        if callback.message:
+            await callback.message.edit_text(
+                f"پنل مدیریت ربات\n\nحالت پذیرش فقط از منابع مجاز: {'فعال' if enabled else 'غیرفعال'}",
+                reply_markup=admin_keyboard(enabled),
+            )
+
+    @router.callback_query(F.data == "admin:add_source")
+    async def admin_add_source(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        admins_adding_source.add(callback.from_user.id)
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "یک فایل یا رسانه را مستقیماً از کانال یا ربات موردنظر برای من فوروارد کنید."
+            )
+
+    @router.callback_query(F.data == "admin:help")
+    async def admin_help(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "برای افزودن مبدأ، دکمه «افزودن مبدأ مجاز» را بزنید و یک رسانه را از همان کانال یا ربات فوروارد کنید.\n"
+                "پیام‌های Forward Privacy یا محتوای محافظت‌شده قابل شناسایی نیستند."
+            )
+
+    @router.callback_query(F.data == "admin:list_sources")
+    async def admin_list_sources(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        sources = await storage.list_sources()
+        await callback.answer()
+        if not callback.message:
+            return
+        if not sources:
+            await callback.message.answer("هنوز هیچ مبدأ مجازی ثبت نشده است.")
+            return
+        buttons = [
+            [InlineKeyboardButton(text=f"حذف {title}", callback_data=f"admin:delete:{source_id}")]
+            for source_id, title, _ in sources
+        ]
+        lines = [f"• {title} — {source_type} — {source_id}" for source_id, title, source_type in sources]
+        await callback.message.answer(
+            "منابع مجاز:\n" + "\n".join(lines),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+    @router.callback_query(F.data.startswith("admin:delete:"))
+    async def admin_delete_source(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        try:
+            source_id = int((callback.data or "").rsplit(":", 1)[1])
+        except (ValueError, IndexError):
+            await callback.answer("درخواست نامعتبر است", show_alert=True)
+            return
+        await storage.remove_source(source_id)
+        await callback.answer("مبدأ حذف شد", show_alert=True)
+        if callback.message:
+            await callback.message.edit_reply_markup(reply_markup=None)
 
     @router.message(CommandStart())
     async def start(message: Message) -> None:
@@ -147,19 +358,50 @@ async def create_app(settings: Settings) -> None:
         if media is None:
             await message.answer("❌ این پیام حاوی فایل قابل دریافت نیست.")
             return
+        user_id = message.from_user.id if message.from_user else None
+        source = forward_source(message)
+        if is_admin(user_id) and user_id in admins_adding_source:
+            if source is None:
+                await message.answer(
+                    "❌ مبدأ قابل شناسایی نیست. رسانه باید مستقیماً از یک کانال یا ربات فوروارد شده باشد."
+                )
+                return
+            source_id, source_title, source_type = source
+            await storage.add_source(source_id, source_title, source_type)
+            admins_adding_source.discard(user_id)
+            await message.answer(
+                f"✅ مبدأ مجاز ثبت شد:\n{hbold(source_title)}\nنوع: {source_type}\nشناسه: {hcode(str(source_id))}",
+                parse_mode=ParseMode.HTML,
+                reply_markup=admin_keyboard(await forward_only_enabled()),
+            )
+            return
+        if await forward_only_enabled():
+            if source is None:
+                await message.answer("❌ فقط فایل‌های فورواردشده از منابع مجاز پذیرفته می‌شوند.")
+                return
+            if not await storage.source_is_allowed(source[0]):
+                await message.answer("❌ این کانال یا ربات در فهرست منابع مجاز نیست.")
+                return
         max_bytes = settings.max_file_size_mb * 1024 * 1024 if settings.max_file_size_mb else 0
         if max_bytes and media.file_size and media.file_size > max_bytes:
             await message.answer(f"❌ حجم فایل بیشتر از {settings.max_file_size_mb} مگابایت است.")
             return
 
-        status = await message.answer("⏳ در حال دریافت و ساخت لینک…")
+        status = await message.answer("مرحله ۱ از ۳ — بررسی فایل و مبدأ ارسال…")
         token = secrets.token_urlsafe(32)
         stored_name = secrets.token_hex(16)
         destination = storage.path_for(stored_name)
         original_name = safe_filename(media.file_name)
         try:
-            await bot.download(media.downloadable, destination=destination)
-            actual_size = destination.stat().st_size
+            actual_size = await download_with_progress(
+                media.downloadable,
+                destination,
+                status,
+                media.file_size,
+            )
+            await status.edit_text(
+                "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…"
+            )
             if max_bytes and actual_size > max_bytes:
                 await storage.delete_stored_file(stored_name)
                 await status.edit_text("❌ حجم فایل از محدودیت مجاز بیشتر است.")
@@ -206,17 +448,40 @@ async def create_app(settings: Settings) -> None:
 
     dispatcher.include_router(router)
 
-    async def get_download_item(request: web.Request) -> tuple[StoredFile, Path]:
+    def secure_page_headers(response: web.StreamResponse) -> None:
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+            "img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+
+    def expired_response() -> web.Response:
+        response = web.Response(
+            text=render_expired_page(),
+            status=web.HTTPGone.status_code,
+            content_type="text/html",
+            charset="utf-8",
+        )
+        secure_page_headers(response)
+        return response
+
+    async def get_download_item(request: web.Request) -> tuple[StoredFile, Path] | None:
         item = await storage.get_valid(request.match_info["token"])
         if item is None:
-            raise web.HTTPNotFound(text="Link not found or expired")
+            return None
         path = storage.path_for(item.stored_name)
         if not path.is_file():
-            raise web.HTTPNotFound(text="File not found")
+            return None
         return item, path
 
     async def download_page(request: web.Request) -> web.Response:
-        item, _ = await get_download_item(request)
+        result = await get_download_item(request)
+        if result is None:
+            return expired_response()
+        item, _ = result
         response = web.Response(
             text=render_download_page(
                 file_name=item.original_name,
@@ -228,18 +493,14 @@ async def create_app(settings: Settings) -> None:
             content_type="text/html",
             charset="utf-8",
         )
-        response.headers["Cache-Control"] = "private, no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = (
-            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
-            "img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
-        )
+        secure_page_headers(response)
         return response
 
     async def download_file(request: web.Request) -> web.StreamResponse:
-        item, path = await get_download_item(request)
+        result = await get_download_item(request)
+        if result is None:
+            raise web.HTTPFound(location=f"/d/{request.match_info['token']}")
+        item, path = result
         response = web.FileResponse(path)
         response.content_type = item.mime_type
         response.headers["Content-Disposition"] = attachment_header(item.original_name)

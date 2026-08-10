@@ -32,6 +32,8 @@ class Settings:
     data_dir: Path
     cleanup_interval_seconds: int
     allowed_user_ids: frozenset[int]
+    admin_user_id: int
+    forward_only: bool
     telegram_api_base: str | None
     telegram_file_base: str | None
 
@@ -47,6 +49,10 @@ class Settings:
 
         raw_ids = os.getenv("ALLOWED_USER_IDS", "").strip()
         allowed_ids = frozenset(int(item.strip()) for item in raw_ids.split(",") if item.strip())
+        admin_user_id = _non_negative_int("ADMIN_USER_ID", 0)
+        forward_only = os.getenv("FORWARD_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
+        if forward_only and not admin_user_id:
+            raise ValueError("ADMIN_USER_ID is required when FORWARD_ONLY is enabled")
         return cls(
             bot_token=token,
             public_base_url=base_url,
@@ -57,6 +63,8 @@ class Settings:
             data_dir=Path(os.getenv("DATA_DIR", "./data")).resolve(),
             cleanup_interval_seconds=_positive_int("CLEANUP_INTERVAL_SECONDS", 300),
             allowed_user_ids=allowed_ids,
+            admin_user_id=admin_user_id,
+            forward_only=forward_only,
             telegram_api_base=os.getenv("TELEGRAM_API_BASE") or None,
             telegram_file_base=os.getenv("TELEGRAM_FILE_BASE") or None,
         )

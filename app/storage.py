@@ -39,7 +39,70 @@ class Storage:
                 )"""
             )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_files_expires ON files(expires_at)")
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS allowed_sources (
+                    source_id INTEGER PRIMARY KEY,
+                    title TEXT NOT NULL,
+                    source_type TEXT NOT NULL,
+                    created_at INTEGER NOT NULL
+                )"""
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS bot_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )"""
+            )
             await db.commit()
+
+    async def ensure_setting(self, key: str, default: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR IGNORE INTO bot_settings(key, value) VALUES (?, ?)",
+                (key, default),
+            )
+            await db.commit()
+
+    async def set_setting(self, key: str, value: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO bot_settings(key, value) VALUES (?, ?)",
+                (key, value),
+            )
+            await db.commit()
+
+    async def get_setting(self, key: str, default: str = "") -> str:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute("SELECT value FROM bot_settings WHERE key = ?", (key,))
+            row = await cursor.fetchone()
+        return row[0] if row else default
+
+    async def add_source(self, source_id: int, title: str, source_type: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "INSERT OR REPLACE INTO allowed_sources VALUES (?, ?, ?, ?)",
+                (source_id, title, source_type, int(time.time())),
+            )
+            await db.commit()
+
+    async def remove_source(self, source_id: int) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM allowed_sources WHERE source_id = ?", (source_id,))
+            await db.commit()
+
+    async def source_is_allowed(self, source_id: int) -> bool:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT 1 FROM allowed_sources WHERE source_id = ?", (source_id,)
+            )
+            return await cursor.fetchone() is not None
+
+    async def list_sources(self) -> list[tuple[int, str, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT source_id, title, source_type FROM allowed_sources ORDER BY created_at DESC"
+            )
+            return await cursor.fetchall()
 
     async def add(self, item: StoredFile) -> None:
         async with aiosqlite.connect(self.db_path) as db:

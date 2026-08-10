@@ -26,6 +26,10 @@ def render_download_page(
     ).replace("{{DOWNLOAD_URL}}", safe_url)
 
 
+def render_expired_page() -> str:
+    return EXPIRED_PAGE
+
+
 PAGE = """<!doctype html>
 <html lang="fa" dir="rtl">
 <head>
@@ -219,5 +223,61 @@ PAGE = """<!doctype html>
       }, 2500);
     });
   </script>
+</body>
+</html>"""
+
+
+EXPIRED_PAGE = """<!doctype html>
+<html lang="fa" dir="rtl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex, nofollow, noarchive">
+  <meta name="theme-color" content="#07152b">
+  <title>لینک منقضی شده است</title>
+  <style>
+    :root { color-scheme: dark; --bg:#07152b; --card:rgba(13,32,58,.9); --line:rgba(158,181,218,.18); --text:#f7faff; --muted:#b8c6db; --accent:#f6b44c; }
+    * { box-sizing: border-box; }
+    html, body { min-height: 100%; }
+    body {
+      margin: 0; min-width: 280px; padding: 24px; display: grid; place-items: center;
+      background: radial-gradient(circle at 82% 8%, rgba(173,107,31,.2), transparent 32rem), var(--bg);
+      color: var(--text); font-family: Tahoma, Arial, sans-serif; font-size: 16px; line-height: 1.7;
+    }
+    main { width: min(100%, 560px); }
+    .card {
+      padding: clamp(28px, 7vw, 48px); text-align: center; border: 1px solid var(--line);
+      border-radius: 28px; background: var(--card); box-shadow: 0 28px 80px rgba(0,0,0,.38);
+      backdrop-filter: blur(18px);
+    }
+    .icon {
+      width: 78px; height: 78px; margin: 0 auto 24px; display: grid; place-items: center;
+      border: 1px solid rgba(246,180,76,.3); border-radius: 24px; background: rgba(246,180,76,.1); color: var(--accent);
+    }
+    h1 { margin: 0 0 10px; font-size: clamp(1.45rem, 5vw, 2rem); line-height: 1.5; }
+    p { max-width: 410px; margin: 0 auto; color: var(--muted); }
+    .status {
+      width: fit-content; min-height: 44px; margin: 26px auto 0; padding: 8px 16px; display: flex;
+      align-items: center; gap: 8px; border: 1px solid rgba(246,180,76,.24); border-radius: 999px;
+      color: #ffd898; background: rgba(246,180,76,.07); font-size: .9rem;
+    }
+    @media (max-width: 480px) { body { padding: 14px; } .card { border-radius: 22px; } }
+    @media (prefers-reduced-motion: reduce) { *,*::before,*::after { transition: none !important; } }
+  </style>
+</head>
+<body>
+  <main>
+    <section class="card" aria-labelledby="expired-title">
+      <div class="icon">
+        <svg aria-hidden="true" width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2M5.6 5.6 3.8 3.8m14.6 1.8 1.8-1.8"/></svg>
+      </div>
+      <h1 id="expired-title">این لینک منقضی شده است</h1>
+      <p>زمان نگهداری فایل به پایان رسیده و فایل از سرور حذف شده است. برای دریافت دوباره، یک لینک جدید از ارسال‌کننده درخواست کنید.</p>
+      <div class="status" role="status">
+        <svg aria-hidden="true" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M10 13a5 5 0 0 0 7.5.5l2-2a5 5 0 0 0-7-7l-1.1 1.1M14 11a5 5 0 0 0-7.5-.5l-2 2a5 5 0 0 0 7 7l1.1-1.1"/><path d="m4 4 16 16"/></svg>
+        لینک دیگر قابل استفاده نیست
+      </div>
+    </section>
+  </main>
 </body>
 </html>"""

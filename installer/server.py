@@ -70,6 +70,8 @@ def install(config: dict[str, str]) -> None:
             "DATA_DIR=/app/data",
             "CLEANUP_INTERVAL_SECONDS=300",
             f"ALLOWED_USER_IDS={env_quote(config['allowed_ids'])}",
+            f"ADMIN_USER_ID={config['admin_id']}",
+            f"FORWARD_ONLY={config['forward_only']}",
             f"TELEGRAM_API_ID={config['api_id']}",
             f"TELEGRAM_API_HASH={env_quote(config['api_hash'])}",
             "TELEGRAM_API_BASE=http://telegram-bot-api:8081",
@@ -186,10 +188,10 @@ class Handler(BaseHTTPRequestHandler):
 const key={json.dumps(SETUP_TOKEN)}; const root=document.getElementById('wizard');
 function dots(n){{document.querySelectorAll('.dot').forEach((x,i)=>x.classList.toggle('on',i<n))}}
 function wizard(n){{dots(n); if(n===2) root.innerHTML=`<h2>مرحله ۲: اطلاعات تلگرام</h2><label>توکن ربات از BotFather</label><input id="bot_token" placeholder="123456:ABC..."><div class="row"><div><label>API ID از my.telegram.org</label><input id="api_id" inputmode="numeric"></div><div><label>API Hash</label><input id="api_hash"></div></div><div class="actions"><button class="btn" onclick="wizard(3)">ادامه</button></div>`;
-if(n===3) root.innerHTML=`<h2>مرحله ۳: دامنه و نگهداری</h2><label>دامنه متصل‌شده به IP سرور</label><input id="domain" placeholder="download.example.com"><div class="row"><div><label>مدت نگهداری فایل (ساعت)</label><input id="ttl" type="number" min="1" value="24"></div><div><label>شناسه کاربران مجاز (اختیاری)</label><input id="allowed_ids" placeholder="12345,67890"></div></div><label>فعال‌سازی خودکار HTTPS</label><select id="ssl"><option value="yes">بله، گواهی رایگان بگیر</option><option value="no">خیر، بعداً انجام می‌دهم</option></select><label>ایمیل برای گواهی SSL</label><input id="email" type="email" placeholder="admin@example.com"><div class="actions"><button class="btn" onclick="wizard(4)">بررسی نهایی</button></div>`;
+if(n===3) root.innerHTML=`<h2>مرحله ۳: دامنه و دسترسی</h2><label>دامنه متصل‌شده به IP سرور</label><input id="domain" placeholder="download.example.com"><div class="row"><div><label>مدت نگهداری فایل (ساعت)</label><input id="ttl" type="number" min="1" value="24"></div><div><label>شناسه عددی مدیر ربات</label><input id="admin_id" inputmode="numeric" placeholder="123456789"></div></div><label>پذیرش فقط فایل فورواردشده از منابع پنل</label><select id="forward_only"><option value="true">فعال</option><option value="false">غیرفعال</option></select><label>شناسه کاربران مجاز (اختیاری)</label><input id="allowed_ids" placeholder="12345,67890"><label>فعال‌سازی خودکار HTTPS</label><select id="ssl"><option value="yes">بله، گواهی رایگان بگیر</option><option value="no">خیر، بعداً انجام می‌دهم</option></select><label>ایمیل برای گواهی SSL</label><input id="email" type="email" placeholder="admin@example.com"><div class="actions"><button class="btn" onclick="wizard(4)">بررسی نهایی</button></div>`;
 if(n===4) root.innerHTML=`<h2>مرحله ۴: تأیید</h2><p class="muted">Docker، ربات، Local Bot API و Nginx راه‌اندازی خواهند شد. دامنه باید هم‌اکنون به IP این سرور اشاره کند.</p><div id="err"></div><div class="actions"><button class="btn" onclick="startInstall()">شروع نصب</button></div>`;}}
 let values={{}}; document.addEventListener('input',e=>{{if(e.target.id)values[e.target.id]=e.target.value}}); document.addEventListener('change',e=>{{if(e.target.id)values[e.target.id]=e.target.value}});
-async function startInstall(){{values.ssl=values.ssl||'yes';values.ttl=values.ttl||'24'; let r=await fetch('/install?key='+encodeURIComponent(key),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(values)}});let j=await r.json();if(!r.ok){{document.getElementById('err').innerHTML='<div class="error">'+j.error+'</div>';return}};dots(5);root.innerHTML='<h2>مرحله ۵: در حال نصب</h2><pre id="log">شروع…</pre>';poll()}}
+async function startInstall(){{values.ssl=values.ssl||'yes';values.ttl=values.ttl||'24';values.forward_only=values.forward_only||'true'; let r=await fetch('/install?key='+encodeURIComponent(key),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(values)}});let j=await r.json();if(!r.ok){{document.getElementById('err').innerHTML='<div class="error">'+j.error+'</div>';return}};dots(5);root.innerHTML='<h2>مرحله ۵: در حال نصب</h2><pre id="log">شروع…</pre>';poll()}}
 async function poll(){{let r=await fetch('/status?key='+encodeURIComponent(key));let j=await r.json();document.getElementById('log').textContent=j.log;document.getElementById('log').scrollTop=999999;if(!j.done&&j.running)setTimeout(poll,1500);else if(j.done)root.insertAdjacentHTML('beforeend','<h3 class="ok">نصب با موفقیت تمام شد ✓</h3>')}}
 </script>"""
 
@@ -215,6 +217,8 @@ async function poll(){{let r=await fetch('/status?key='+encodeURIComponent(key))
             if not 1 <= ttl <= 8760: errors.append("زمان نگهداری باید بین ۱ و ۸۷۶۰ ساعت باشد")
             allowed = str(config.get("allowed_ids", ""))
             if allowed and not re.fullmatch(r"\d+(?:,\d+)*", allowed): errors.append("شناسه‌های کاربران معتبر نیست")
+            if not str(config.get("admin_id", "")).isdigit() or int(config.get("admin_id", 0)) <= 0: errors.append("شناسه مدیر معتبر نیست")
+            if config.get("forward_only") not in {"true", "false"}: errors.append("حالت محدودسازی معتبر نیست")
             if config.get("ssl") == "yes" and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(config.get("email", ""))): errors.append("ایمیل SSL معتبر نیست")
             if os.geteuid() != 0: errors.append("نصب‌کننده باید با sudo اجرا شود")
             for executable in ("docker", "nginx", "systemctl"):
@@ -223,7 +227,7 @@ async function poll(){{let r=await fetch('/status?key='+encodeURIComponent(key))
             if errors:
                 self.send_json({"error": "، ".join(errors)}, 400)
                 return
-            config = {k: str(config.get(k, "")).strip() for k in ("bot_token", "api_id", "api_hash", "domain", "ttl", "allowed_ids", "ssl", "email")}
+            config = {k: str(config.get(k, "")).strip() for k in ("bot_token", "api_id", "api_hash", "domain", "ttl", "allowed_ids", "admin_id", "forward_only", "ssl", "email")}
             with LOCK:
                 if INSTALLING:
                     self.send_json({"error": "نصب در حال اجراست"}, 409)

@@ -17,10 +17,11 @@ from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
-from aiogram.types import Message
-from aiogram.utils.markdown import hbold, hcode
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message
+from aiogram.utils.markdown import hbold, hcode, hlink
 
 from .config import Settings
+from .download_page import render_download_page
 from .storage import Storage, StoredFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -80,6 +81,15 @@ def attachment_header(filename: str) -> str:
 
     ascii_name = filename.encode("ascii", "ignore").decode().replace('"', "") or "download"
     return f'attachment; filename="{ascii_name}"; filename*=UTF-8\'\'{quote(filename)}'
+
+
+def human_size(size: int) -> str:
+    value = float(size)
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+        value /= 1024
+    return f"{size} B"
 
 
 async def create_app(settings: Settings) -> None:
@@ -174,9 +184,19 @@ async def create_app(settings: Settings) -> None:
         link = f"{settings.public_base_url}/d/{token}"
         expiry = datetime.fromtimestamp(expires_at).astimezone().strftime("%Y-%m-%d %H:%M")
         await status.edit_text(
-            f"✅ لینک دانلود آماده است:\n{hcode(link)}\n\n"
-            f"نام فایل: {hbold(original_name)}\nانقضا: {expiry}",
+            f"✅ فایل با موفقیت روی سرور ذخیره شد.\n\n"
+            f"🔗 {hlink('دانلود مستقیم فایل', link)}\n"
+            f"📋 لینک برای کپی:\n{hcode(link)}\n\n"
+            f"نام فایل: {hbold(original_name)}\n"
+            f"حجم: {human_size(actual_size)}\n"
+            f"انقضا: {expiry}",
             parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬇️ دانلود فایل", url=link)]
+                ]
+            ),
+            disable_web_page_preview=True,
         )
 
     @router.message()
@@ -186,13 +206,40 @@ async def create_app(settings: Settings) -> None:
 
     dispatcher.include_router(router)
 
-    async def download(request: web.Request) -> web.StreamResponse:
+    async def get_download_item(request: web.Request) -> tuple[StoredFile, Path]:
         item = await storage.get_valid(request.match_info["token"])
         if item is None:
             raise web.HTTPNotFound(text="Link not found or expired")
         path = storage.path_for(item.stored_name)
         if not path.is_file():
             raise web.HTTPNotFound(text="File not found")
+        return item, path
+
+    async def download_page(request: web.Request) -> web.Response:
+        item, _ = await get_download_item(request)
+        response = web.Response(
+            text=render_download_page(
+                file_name=item.original_name,
+                file_size=human_size(item.size),
+                mime_type=item.mime_type,
+                expires_at=item.expires_at,
+                download_url=f"/download/{item.token}",
+            ),
+            content_type="text/html",
+            charset="utf-8",
+        )
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; "
+            "img-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+        )
+        return response
+
+    async def download_file(request: web.Request) -> web.StreamResponse:
+        item, path = await get_download_item(request)
         response = web.FileResponse(path)
         response.content_type = item.mime_type
         response.headers["Content-Disposition"] = attachment_header(item.original_name)
@@ -203,7 +250,8 @@ async def create_app(settings: Settings) -> None:
         return web.json_response({"status": "ok"})
 
     web_app = web.Application()
-    web_app.router.add_get("/d/{token}", download)
+    web_app.router.add_get("/d/{token}", download_page)
+    web_app.router.add_get("/download/{token}", download_file)
     web_app.router.add_get("/health", health)
     runner = web.AppRunner(web_app)
     await runner.setup()

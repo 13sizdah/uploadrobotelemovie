@@ -71,6 +71,17 @@ class AdminWebTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("<script>alert", body)
         self.assertIn("&lt;script&gt;", body)
 
+    async def test_storage_sections_are_split_into_separate_pages(self) -> None:
+        overview = await self.client.get("/manage/storage", headers=self.headers)
+        overview_body = await overview.text()
+        self.assertNotIn("<h2>مسیر فایل‌های جدید</h2>", overview_body)
+        self.assertNotIn("<h2>افزودن فضای جدید</h2>", overview_body)
+
+        routing = await self.client.get("/manage/storage/routing", headers=self.headers)
+        self.assertIn("<h2>مسیر فایل‌های جدید</h2>", await routing.text())
+        adding = await self.client.get("/manage/storage/new", headers=self.headers)
+        self.assertIn("<h2>افزودن فضای جدید</h2>", await adding.text())
+
     async def test_backup_and_password_change_are_persistent(self) -> None:
         response = await self.client.post(
             "/manage/backups/create",

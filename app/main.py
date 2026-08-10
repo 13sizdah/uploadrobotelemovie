@@ -36,6 +36,7 @@ from .config import Settings
 from .admin_web import AdminWeb
 from .download_page import render_download_page, render_expired_page
 from .object_storage import ObjectStorageManager, UploadCancelled
+from .replication_api import ReplicationAPI
 from .secure_config import EncryptedConfigStore
 from .storage import Storage, StoredFile
 
@@ -133,6 +134,7 @@ async def create_app(settings: Settings) -> None:
     await storage.ensure_setting("storage_backend", settings.storage_backend)
     await storage.ensure_setting("replication_count", "1")
     await storage.ensure_setting("replication_paused", "0")
+    await storage.ensure_setting("replication_api_token", secrets.token_urlsafe(32))
     await storage.ensure_setting(
         "admin_web_password_hash", settings.admin_web_password_hash or ""
     )
@@ -996,6 +998,7 @@ async def create_app(settings: Settings) -> None:
     web_app.router.add_get("/d/{token}", download_page)
     web_app.router.add_get("/download/{token}", download_file)
     web_app.router.add_get("/health", health)
+    ReplicationAPI(storage).install(web_app)
     active_admin_password_hash = await storage.get_setting(
         "admin_web_password_hash", settings.admin_web_password_hash or ""
     )
@@ -1055,7 +1058,10 @@ async def create_app(settings: Settings) -> None:
                 if await storage.get_setting("replication_paused", "0") == "1":
                     await asyncio.sleep(5)
                     continue
-                jobs = await storage.due_replication_jobs(limit=5)
+                external_targets = await storage.active_worker_targets()
+                jobs = await storage.due_replication_jobs(
+                    limit=5, excluded_targets=external_targets
+                )
                 if not jobs:
                     await asyncio.sleep(5)
                     continue

@@ -69,6 +69,7 @@ class AdminWeb:
         app.router.add_post("/manage/jobs/retry", self.retry_jobs)
         app.router.add_post("/manage/jobs/pause", self.toggle_replication_pause)
         app.router.add_post("/manage/settings/password", self.change_password)
+        app.router.add_post("/manage/settings/replication-token", self.rotate_replication_token)
         app.router.add_post("/manage/backups/create", self.create_backup)
         app.router.add_post("/manage/storage/add", self.add_storage)
         app.router.add_post("/manage/storage/mode", self.set_storage_mode)
@@ -228,7 +229,16 @@ class AdminWeb:
         table = "".join(rows) or '<tr><td colspan="6" class="muted">صف خالی است.</td></tr>'
         state = "متوقف" if paused else "در حال اجرا"
         action = "ادامه صف" if paused else "توقف صف"
-        return self.page(f'''<section class="card"><h2>صف انتقال پایدار</h2><p>وضعیت: <b>{state}</b></p><p class="muted">کارهای ناموفق بعد از restart باقی می‌مانند و با فاصله افزایشی دوباره اجرا می‌شوند.</p><div class="row"><form method="post" action="/manage/jobs/pause"><input type="hidden" name="csrf" value="{session.csrf}"><button class="secondary">{action}</button></form><form method="post" action="/manage/jobs/retry"><input type="hidden" name="csrf" value="{session.csrf}"><button>اجرای دوباره همه کارها</button></form></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>فایل</th><th>مقصد</th><th>تلاش</th><th>اجرای بعد</th><th>آخرین خطا</th></tr></thead><tbody>{table}</tbody></table></div></section>''', "jobs", True)
+        workers = []
+        now = int(time.time())
+        for worker_id, last_seen, current_job, completed, last_error, targets in await self.storage.replication_workers():
+            online = now - last_seen < 600
+            seen = datetime.fromtimestamp(last_seen).astimezone().strftime("%Y-%m-%d %H:%M:%S")
+            workers.append(
+                f'''<tr><td><code>{html.escape(worker_id)}</code><br><small>{html.escape(targets)}</small></td><td><span class="badge">{"آنلاین" if online else "آفلاین"}</span></td><td>{current_job or "—"}</td><td>{completed}</td><td>{seen}</td><td>{html.escape(last_error or "—")}</td></tr>'''
+            )
+        worker_table = "".join(workers) or '<tr><td colspan="6" class="muted">هنوز Worker خارجی متصل نشده است.</td></tr>'
+        return self.page(f'''<section class="card"><h2>صف انتقال پایدار</h2><p>وضعیت: <b>{state}</b></p><p class="muted">کارهای ناموفق بعد از restart باقی می‌مانند و با فاصله افزایشی دوباره اجرا می‌شوند.</p><div class="row"><form method="post" action="/manage/jobs/pause"><input type="hidden" name="csrf" value="{session.csrf}"><button class="secondary">{action}</button></form><form method="post" action="/manage/jobs/retry"><input type="hidden" name="csrf" value="{session.csrf}"><button>اجرای دوباره همه کارها</button></form></div><div class="table-wrap"><table><thead><tr><th>ID</th><th>فایل</th><th>مقصد</th><th>تلاش</th><th>اجرای بعد</th><th>آخرین خطا</th></tr></thead><tbody>{table}</tbody></table></div></section><section class="card"><h2>Workerهای انتقال</h2><p class="muted">Worker ایران بدون پورت ورودی، صف را از این سرور دریافت می‌کند و انتقال قطع‌شده را ادامه می‌دهد.</p><div class="table-wrap"><table><thead><tr><th>نام</th><th>وضعیت</th><th>کار جاری</th><th>تکمیل‌شده</th><th>آخرین اتصال</th><th>خطا</th></tr></thead><tbody>{worker_table}</tbody></table></div></section>''', "jobs", True)
 
     async def system_page(self, request: web.Request) -> web.Response:
         session = self.session(request)
@@ -265,7 +275,8 @@ class AdminWeb:
             f'<p><a href="/manage/backups/{item.name}">{html.escape(item.name)}</a> — {self._size(item.stat().st_size)}</p>'
             for item in backups
         ) or '<p class="muted">هنوز بکاپی ساخته نشده است.</p>'
-        body = f'''<section class="two"><div class="card"><h2>تغییر رمز پنل</h2><form method="post" action="/manage/settings/password"><input type="hidden" name="csrf" value="{session.csrf}"><label>رمز فعلی</label><input name="current_password" type="password" autocomplete="current-password" required><label>رمز جدید</label><input name="new_password" type="password" minlength="12" autocomplete="new-password" required><label>تکرار رمز جدید</label><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required><button>تغییر رمز و خروج سایر نشست‌ها</button></form></div><div class="card"><h2>بکاپ دیتابیس</h2><p class="muted">Snapshot سازگار SQLite؛ شامل فایل‌های حجیم و کلیدهای S3 نیست.</p><form method="post" action="/manage/backups/create"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت بکاپ جدید</button></form>{backup_links}</div></section>'''
+        replication_token = html.escape(await self.storage.get_setting("replication_api_token"))
+        body = f'''<section class="two"><div class="card"><h2>تغییر رمز پنل</h2><form method="post" action="/manage/settings/password"><input type="hidden" name="csrf" value="{session.csrf}"><label>رمز فعلی</label><input name="current_password" type="password" autocomplete="current-password" required><label>رمز جدید</label><input name="new_password" type="password" minlength="12" autocomplete="new-password" required><label>تکرار رمز جدید</label><input name="confirm_password" type="password" minlength="12" autocomplete="new-password" required><button>تغییر رمز و خروج سایر نشست‌ها</button></form></div><div class="card"><h2>بکاپ دیتابیس</h2><p class="muted">Snapshot سازگار SQLite؛ شامل فایل‌های حجیم و کلیدهای S3 نیست.</p><form method="post" action="/manage/backups/create"><input type="hidden" name="csrf" value="{session.csrf}"><button>ساخت بکاپ جدید</button></form>{backup_links}</div></section><section class="card"><h2>اتصال Worker ایران</h2><p class="muted">این توکن را فقط در فایل <code>.env</code> سرور Worker قرار دهید. توکن به اطلاعات S3 دسترسی مستقیم نمی‌دهد.</p><details><summary>نمایش توکن اتصال</summary><p><code>{replication_token}</code></p></details><form method="post" action="/manage/settings/replication-token"><input type="hidden" name="csrf" value="{session.csrf}"><button class="danger">باطل‌کردن و ساخت توکن جدید</button></form></section>'''
         return self.page(body, "settings", True)
 
     async def change_password(self, request: web.Request) -> web.Response:
@@ -284,6 +295,12 @@ class AdminWeb:
         session.csrf = secrets.token_urlsafe(24)
         self.sessions = {token: session}
         await self.storage.add_audit(request.remote or "unknown", "password_changed")
+        raise web.HTTPFound("/manage/settings")
+
+    async def rotate_replication_token(self, request: web.Request) -> web.Response:
+        await self.require_form_session(request)
+        await self.storage.set_setting("replication_api_token", secrets.token_urlsafe(32))
+        await self.storage.add_audit(request.remote or "unknown", "replication_token_rotated")
         raise web.HTTPFound("/manage/settings")
 
     async def create_backup(self, request: web.Request) -> web.Response:

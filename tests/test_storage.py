@@ -91,6 +91,49 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             [("minio", "files/queued")],
         )
 
+    async def test_remote_worker_claim_is_exclusive_and_completes(self) -> None:
+        item = StoredFile(
+            "remote", "spool", "movie.mkv", "video/x-matroska",
+            500, 4_000_000_000, "bunny", "files/remote",
+        )
+        await self.storage.add_with_replication_jobs(
+            item, [("parspack", "files/remote")]
+        )
+
+        claimed = await self.storage.claim_replication_job(
+            "iran-1", ["parspack"], lease_seconds=900
+        )
+        self.assertIsNotNone(claimed)
+        self.assertEqual(claimed.source_backend, "bunny")
+        self.assertIsNone(
+            await self.storage.claim_replication_job("iran-2", ["parspack"])
+        )
+        self.assertEqual(await self.storage.due_replication_jobs(), [])
+        self.assertTrue(await self.storage.renew_replication_lease(claimed.id, "iran-1"))
+        self.assertTrue(
+            await self.storage.finish_claimed_replication_job(claimed.id, "iran-1")
+        )
+        self.assertEqual(
+            await self.storage.replicas_for("remote"),
+            [("parspack", "files/remote")],
+        )
+        workers = await self.storage.replication_workers()
+        self.assertEqual(workers[0][0], "iran-1")
+        self.assertEqual(workers[0][3], 1)
+
+    async def test_local_worker_can_exclude_remote_targets(self) -> None:
+        item = StoredFile(
+            "routing", "spool", "movie.mkv", "video/x-matroska",
+            500, 4_000_000_000, "bunny", "files/routing",
+        )
+        await self.storage.add_with_replication_jobs(
+            item, [("parspack", "files/routing")]
+        )
+        self.assertEqual(
+            await self.storage.due_replication_jobs(excluded_targets=("parspack",)),
+            [],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

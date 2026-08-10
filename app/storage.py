@@ -31,6 +31,20 @@ class ReplicationJob:
 
 
 @dataclass(frozen=True)
+class ClaimedReplicationJob:
+    id: int
+    token: str
+    target_backend: str
+    object_key: str
+    attempts: int
+    source_backend: str
+    source_object_key: str
+    original_name: str
+    mime_type: str
+    size: int
+
+
+@dataclass(frozen=True)
 class AdminFile:
     token: str
     original_name: str
@@ -121,6 +135,36 @@ class Storage:
                 "CREATE INDEX IF NOT EXISTS idx_replication_jobs_due "
                 "ON replication_jobs(next_attempt_at, id)"
             )
+            job_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(replication_jobs)")).fetchall()
+            }
+            if "claimed_by" not in job_columns:
+                await db.execute(
+                    "ALTER TABLE replication_jobs ADD COLUMN claimed_by TEXT NOT NULL DEFAULT ''"
+                )
+            if "lease_until" not in job_columns:
+                await db.execute(
+                    "ALTER TABLE replication_jobs ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0"
+                )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS replication_workers (
+                    worker_id TEXT PRIMARY KEY,
+                    last_seen INTEGER NOT NULL,
+                    current_job INTEGER,
+                    completed_count INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    targets TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            worker_columns = {
+                row[1]
+                for row in await (await db.execute("PRAGMA table_info(replication_workers)")).fetchall()
+            }
+            if "targets" not in worker_columns:
+                await db.execute(
+                    "ALTER TABLE replication_workers ADD COLUMN targets TEXT NOT NULL DEFAULT ''"
+                )
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -329,17 +373,153 @@ class Storage:
                 )
             await db.commit()
 
-    async def due_replication_jobs(self, limit: int = 10) -> list[ReplicationJob]:
+    async def due_replication_jobs(
+        self, limit: int = 10, excluded_targets: tuple[str, ...] = ()
+    ) -> list[ReplicationJob]:
+        exclusions = ""
+        params: list[object] = [int(time.time()), int(time.time()), int(time.time())]
+        if excluded_targets:
+            exclusions = " AND j.target_backend NOT IN (" + ",".join("?" for _ in excluded_targets) + ")"
+            params.extend(excluded_targets)
+        params.append(limit)
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                """SELECT j.id, j.token, j.target_backend, j.object_key, j.attempts
+                f"""SELECT j.id, j.token, j.target_backend, j.object_key, j.attempts
                    FROM replication_jobs j JOIN files f ON f.token = j.token
                    WHERE j.next_attempt_at <= ? AND f.expires_at > ?
+                     AND (j.lease_until = 0 OR j.lease_until <= ?)
+                     {exclusions}
                    ORDER BY j.next_attempt_at, j.id LIMIT ?""",
-                (int(time.time()), int(time.time()), limit),
+                params,
             )
             rows = await cursor.fetchall()
         return [ReplicationJob(*row) for row in rows]
+
+    async def claim_replication_job(
+        self,
+        worker_id: str,
+        targets: list[str],
+        lease_seconds: int = 900,
+    ) -> ClaimedReplicationJob | None:
+        if not worker_id or not targets:
+            return None
+        now = int(time.time())
+        placeholders = ",".join("?" for _ in targets)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                f"""SELECT j.id, j.token, j.target_backend, j.object_key, j.attempts,
+                           f.backend_name, f.object_key, f.original_name, f.mime_type, f.size
+                    FROM replication_jobs j JOIN files f ON f.token = j.token
+                    WHERE j.next_attempt_at <= ? AND f.expires_at > ?
+                      AND (j.lease_until = 0 OR j.lease_until <= ?)
+                      AND j.target_backend IN ({placeholders})
+                      AND f.backend_name != 'local' AND f.object_key IS NOT NULL
+                    ORDER BY j.next_attempt_at, j.id LIMIT 1""",
+                (now, now, now, *targets),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await db.execute(
+                    """INSERT INTO replication_workers(worker_id, last_seen, current_job, targets)
+                       VALUES (?, ?, NULL, ?) ON CONFLICT(worker_id) DO UPDATE SET
+                       last_seen = excluded.last_seen, current_job = NULL,
+                       targets = excluded.targets""",
+                    (worker_id, now, ",".join(targets)),
+                )
+                await db.commit()
+                return None
+            await db.execute(
+                "UPDATE replication_jobs SET claimed_by = ?, lease_until = ?, updated_at = ? WHERE id = ?",
+                (worker_id, now + max(60, lease_seconds), now, row[0]),
+            )
+            await db.execute(
+                """INSERT INTO replication_workers(worker_id, last_seen, current_job, last_error, targets)
+                   VALUES (?, ?, ?, '', ?) ON CONFLICT(worker_id) DO UPDATE SET
+                   last_seen = excluded.last_seen, current_job = excluded.current_job,
+                   last_error = '', targets = excluded.targets""",
+                (worker_id, now, row[0], ",".join(targets)),
+            )
+            await db.commit()
+        return ClaimedReplicationJob(*row)
+
+    async def finish_claimed_replication_job(
+        self, job_id: int, worker_id: str, error: str = ""
+    ) -> str | None:
+        now = int(time.time())
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                """SELECT token, target_backend, object_key, attempts
+                   FROM replication_jobs WHERE id = ? AND claimed_by = ?""",
+                (job_id, worker_id),
+            )
+            row = await cursor.fetchone()
+            if row is None:
+                await db.rollback()
+                return None
+            if error:
+                attempts = int(row[3]) + 1
+                delay = min(3600, 15 * (2 ** min(attempts, 8)))
+                await db.execute(
+                    """UPDATE replication_jobs SET attempts = ?, next_attempt_at = ?,
+                       last_error = ?, claimed_by = '', lease_until = 0, updated_at = ?
+                       WHERE id = ?""",
+                    (attempts, now + delay, error[:300], now, job_id),
+                )
+                await db.execute(
+                    "UPDATE replication_workers SET last_seen = ?, current_job = NULL, last_error = ? WHERE worker_id = ?",
+                    (now, error[:300], worker_id),
+                )
+            else:
+                await db.execute(
+                    "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
+                    (row[0], row[1], row[2], now),
+                )
+                await db.execute("DELETE FROM replication_jobs WHERE id = ?", (job_id,))
+                await db.execute(
+                    """UPDATE replication_workers SET last_seen = ?, current_job = NULL,
+                       completed_count = completed_count + 1, last_error = '' WHERE worker_id = ?""",
+                    (now, worker_id),
+                )
+            await db.commit()
+        return str(row[0])
+
+    async def renew_replication_lease(
+        self, job_id: int, worker_id: str, lease_seconds: int = 900
+    ) -> bool:
+        now = int(time.time())
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE replication_jobs SET lease_until = ?, updated_at = ?
+                   WHERE id = ? AND claimed_by = ?""",
+                (now + max(60, lease_seconds), now, job_id, worker_id),
+            )
+            await db.execute(
+                "UPDATE replication_workers SET last_seen = ? WHERE worker_id = ?",
+                (now, worker_id),
+            )
+            await db.commit()
+        return cursor.rowcount == 1
+
+    async def replication_workers(self) -> list[tuple[str, int, int | None, int, str, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT worker_id, last_seen, current_job, completed_count, last_error, targets
+                   FROM replication_workers ORDER BY last_seen DESC"""
+            )
+            return await cursor.fetchall()
+
+    async def active_worker_targets(self, max_age_seconds: int = 600) -> tuple[str, ...]:
+        cutoff = int(time.time()) - max_age_seconds
+        targets: set[str] = set()
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT targets FROM replication_workers WHERE last_seen >= ?", (cutoff,)
+            )
+            for row in await cursor.fetchall():
+                targets.update(value.strip() for value in row[0].split(",") if value.strip())
+        return tuple(sorted(targets))
 
     async def complete_replication_job(self, job: ReplicationJob) -> None:
         async with aiosqlite.connect(self.db_path) as db:

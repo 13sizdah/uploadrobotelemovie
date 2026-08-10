@@ -48,6 +48,7 @@ class AdminWebTests(unittest.IsolatedAsyncioTestCase):
             "/manage/storage/routing": "<h2>مسیر فایل‌های جدید</h2>",
             "/manage/storage/new": "<h2>افزودن فضای جدید</h2>",
             "/manage/jobs": "صف انتقال پایدار",
+            "/manage/reports": "دانلود ۳۰ روز",
             "/manage/system": "وضعیت backendها",
             "/manage/audit": "رویدادهای مدیریتی",
             "/manage/settings": "تغییر رمز پنل",

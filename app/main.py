@@ -984,11 +984,13 @@ async def create_app(settings: Settings) -> None:
             if selected is None:
                 return expired_response()
             backend_name, object_key = selected
+            await storage.record_download(backend_name, item.size)
             url = await object_storage.presigned_download(
                 backend_name, object_key, item.original_name
             )
             raise web.HTTPFound(location=url)
         assert path is not None
+        await storage.record_download("local", item.size)
         response = web.FileResponse(path)
         response.content_type = item.mime_type
         response.headers["Content-Disposition"] = attachment_header(item.original_name)

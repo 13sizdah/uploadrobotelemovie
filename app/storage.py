@@ -177,6 +177,15 @@ class Storage:
             await db.execute(
                 "CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_log(created_at DESC)"
             )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS download_daily_stats (
+                    day TEXT NOT NULL,
+                    backend_name TEXT NOT NULL,
+                    requests INTEGER NOT NULL DEFAULT 0,
+                    bytes_served INTEGER NOT NULL DEFAULT 0,
+                    PRIMARY KEY(day, backend_name)
+                )"""
+            )
             await db.commit()
 
     async def ensure_setting(self, key: str, default: str) -> None:
@@ -609,6 +618,32 @@ class Storage:
                 "SELECT created_at, actor, action, detail FROM audit_log "
                 "ORDER BY id DESC LIMIT ?",
                 (limit,),
+            )
+            return await cursor.fetchall()
+
+    async def record_download(self, backend_name: str, size: int) -> None:
+        day = time.strftime("%Y-%m-%d", time.gmtime())
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO download_daily_stats(day, backend_name, requests, bytes_served)
+                   VALUES (?, ?, 1, ?) ON CONFLICT(day, backend_name) DO UPDATE SET
+                   requests = requests + 1, bytes_served = bytes_served + excluded.bytes_served""",
+                (day, backend_name[:100], max(0, size)),
+            )
+            await db.commit()
+
+    async def download_statistics(
+        self, days: int = 30
+    ) -> list[tuple[str, str, int, int]]:
+        cutoff = time.strftime(
+            "%Y-%m-%d", time.gmtime(time.time() - max(1, days - 1) * 86400)
+        )
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT day, backend_name, requests, bytes_served
+                   FROM download_daily_stats WHERE day >= ?
+                   ORDER BY day DESC, backend_name""",
+                (cutoff,),
             )
             return await cursor.fetchall()
 

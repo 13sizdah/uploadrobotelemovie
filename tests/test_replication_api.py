@@ -80,6 +80,22 @@ class ReplicationAPITests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(current.status, 200)
 
+    async def test_repeated_authentication_failures_are_rate_limited(self) -> None:
+        statuses = []
+        for _ in range(11):
+            response = await self.client.post(
+                "/internal/replication/claim",
+                json={"worker_id": "attacker", "targets": ["parspack"]},
+            )
+            statuses.append(response.status)
+        self.assertEqual(statuses[:10], [401] * 10)
+        self.assertEqual(statuses[10], 429)
+        valid = await self.client.post(
+            "/internal/replication/claim", headers=self.headers,
+            json={"worker_id": "iran-1", "targets": ["parspack"]},
+        )
+        self.assertEqual(valid.status, 200)
+
 
 if __name__ == "__main__":
     unittest.main()

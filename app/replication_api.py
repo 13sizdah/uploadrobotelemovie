@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hmac
+import time
 from aiohttp import web
 
 from .storage import Storage
@@ -11,6 +12,7 @@ class ReplicationAPI:
 
     def __init__(self, storage: Storage) -> None:
         self.storage = storage
+        self.failed_auth: dict[str, list[float]] = {}
 
     def install(self, app: web.Application) -> None:
         app.router.add_post("/internal/replication/claim", self.claim)
@@ -19,9 +21,19 @@ class ReplicationAPI:
         app.router.add_post("/internal/replication/{job_id}/renew", self.renew)
 
     async def authorize(self, request: web.Request) -> None:
+        remote = request.remote or "unknown"
+        now = time.monotonic()
+        attempts = [value for value in self.failed_auth.get(remote, []) if now - value < 300]
         supplied = request.headers.get("Authorization", "").removeprefix("Bearer ")
         expected = await self.storage.get_setting("replication_api_token")
+        if supplied and expected and hmac.compare_digest(supplied, expected):
+            self.failed_auth.pop(remote, None)
+            return
+        if len(attempts) >= 10:
+            raise web.HTTPTooManyRequests(text="Too many authentication failures")
         if not supplied or not expected or not hmac.compare_digest(supplied, expected):
+            attempts.append(now)
+            self.failed_auth[remote] = attempts
             raise web.HTTPUnauthorized(
                 text="Unauthorized", headers={"WWW-Authenticate": "Bearer"}
             )

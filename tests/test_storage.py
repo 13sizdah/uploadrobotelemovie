@@ -134,6 +134,16 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
+    async def test_download_statistics_are_aggregated_per_day_and_backend(self) -> None:
+        await self.storage.record_download("bunny", 100)
+        await self.storage.record_download("bunny", 250)
+        await self.storage.record_download("parspack", 50)
+
+        stats = await self.storage.download_statistics(30)
+        by_backend = {backend: (requests, size) for _, backend, requests, size in stats}
+        self.assertEqual(by_backend["bunny"], (2, 350))
+        self.assertEqual(by_backend["parspack"], (1, 50))
+
 
 if __name__ == "__main__":
     unittest.main()

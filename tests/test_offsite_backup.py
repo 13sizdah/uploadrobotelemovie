@@ -15,6 +15,7 @@ class FakeManager:
     def __init__(self) -> None:
         self.upload: tuple[str, str, str] | None = None
         self.members: set[str] = set()
+        self.pruned: tuple[str, str, int] | None = None
 
     async def upload_to(
         self, backend: str, source: Path, object_key: str, content_type: str
@@ -22,6 +23,10 @@ class FakeManager:
         self.upload = backend, object_key, content_type
         with tarfile.open(source, "r:gz") as archive:
             self.members = set(archive.getnames())
+
+    async def prune_prefix(self, backend: str, prefix: str, keep: int) -> int:
+        self.pruned = backend, prefix, keep
+        return 0
 
 
 class OffsiteBackupTests(unittest.IsolatedAsyncioTestCase):
@@ -48,6 +53,7 @@ class OffsiteBackupTests(unittest.IsolatedAsyncioTestCase):
 
             self.assertTrue(key.startswith("system-backups/offsite-"))
             self.assertEqual(manager.upload[0], "backup")
+            self.assertEqual(manager.pruned, ("backup", "system-backups/", 7))
             self.assertEqual(
                 manager.members,
                 {"data/files.sqlite3", "data/config.key", "data/s3-backends.enc"},

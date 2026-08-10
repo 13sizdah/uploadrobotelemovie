@@ -330,6 +330,37 @@ class ObjectStorageManager:
             Key=object_key,
         )
 
+    async def prune_prefix(self, backend_name: str, prefix: str, keep: int) -> int:
+        backend = self.backends.get(backend_name)
+        if backend is None:
+            raise RuntimeError(f"Unknown S3 backend: {backend_name}")
+
+        def prune() -> int:
+            client = backend.client()
+            objects: list[dict[str, object]] = []
+            continuation: str | None = None
+            while True:
+                kwargs: dict[str, object] = {
+                    "Bucket": backend.bucket, "Prefix": prefix, "MaxKeys": 1000
+                }
+                if continuation:
+                    kwargs["ContinuationToken"] = continuation
+                response = client.list_objects_v2(**kwargs)
+                objects.extend(response.get("Contents", []))
+                if not response.get("IsTruncated"):
+                    break
+                continuation = str(response["NextContinuationToken"])
+            objects.sort(key=lambda item: item.get("LastModified", ""), reverse=True)
+            stale = objects[max(1, keep):]
+            if stale:
+                client.delete_objects(
+                    Bucket=backend.bucket,
+                    Delete={"Objects": [{"Key": item["Key"]} for item in stale]},
+                )
+            return len(stale)
+
+        return await asyncio.to_thread(prune)
+
     async def presigned_download(self, backend_name: str, object_key: str, filename: str) -> str:
         backend = self.backends.get(backend_name)
         if backend is None:

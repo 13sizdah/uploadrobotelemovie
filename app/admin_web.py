@@ -49,6 +49,7 @@ class AdminWeb:
         app.router.add_get("/manage/jobs", self.jobs_page)
         app.router.add_get("/manage/system", self.system_page)
         app.router.add_get("/manage/audit", self.audit_page)
+        app.router.add_get("/manage/reports", self.reports_page)
         app.router.add_get("/manage/settings", self.settings_page)
         app.router.add_get("/manage/backups/{name}", self.download_backup)
         app.router.add_get("/manage/jobs/pause", self.redirect_to_jobs)
@@ -107,7 +108,7 @@ class AdminWeb:
     def page(self, body: str, active: str = "", authenticated: bool = False) -> web.Response:
         if not authenticated and "مسیر فایل‌های جدید" in body:
             active, authenticated = "storage", True
-        links = (("dashboard", "/manage/", "◈", "داشبورد"), ("files", "/manage/files", "▤", "فایل‌ها"), ("storage", "/manage/storage", "◉", "فضاها"), ("jobs", "/manage/jobs", "⇄", "صف انتقال"), ("system", "/manage/system", "◌", "سیستم"), ("audit", "/manage/audit", "≡", "رویدادها"), ("settings", "/manage/settings", "⚙", "تنظیمات"))
+        links = (("dashboard", "/manage/", "◈", "داشبورد"), ("files", "/manage/files", "▤", "فایل‌ها"), ("storage", "/manage/storage", "◉", "فضاها"), ("jobs", "/manage/jobs", "⇄", "صف انتقال"), ("reports", "/manage/reports", "▥", "گزارش‌ها"), ("system", "/manage/system", "◌", "سیستم"), ("audit", "/manage/audit", "≡", "رویدادها"), ("settings", "/manage/settings", "⚙", "تنظیمات"))
         navigation = ""
         if authenticated:
             navigation = '<aside><div class="brand"><span class="brand-mark">↑</span><div><b>FileFlow</b><small>مدیریت ربات</small></div></div><nav aria-label="منوی مدیریت">' + "".join(
@@ -268,6 +269,28 @@ class AdminWeb:
             f'''<section class="card"><h2>رویدادهای مدیریتی</h2><p class="muted">۲۰۰ عملیات معتبر اخیر همراه IP و زمان ثبت می‌شود؛ رمزها و کلیدها در گزارش قرار نمی‌گیرند.</p><div class="table-wrap"><table><thead><tr><th>زمان</th><th>IP</th><th>عملیات</th><th>جزئیات</th></tr></thead><tbody>{table}</tbody></table></div></section>''',
             "audit", True,
         )
+
+    async def reports_page(self, request: web.Request) -> web.Response:
+        if not self.session(request):
+            raise web.HTTPFound("/manage/")
+        stats = await self.storage.download_statistics(30)
+        total_requests = sum(item[2] for item in stats)
+        total_bytes = sum(item[3] for item in stats)
+        backend_totals: dict[str, list[int]] = {}
+        for _, backend, requests, size in stats:
+            values = backend_totals.setdefault(backend, [0, 0])
+            values[0] += requests
+            values[1] += size
+        backend_rows = "".join(
+            f"<tr><td>{html.escape(name)}</td><td>{values[0]}</td><td>{self._size(values[1])}</td></tr>"
+            for name, values in sorted(backend_totals.items(), key=lambda item: item[1][1], reverse=True)
+        ) or '<tr><td colspan="3" class="muted">هنوز دانلودی ثبت نشده است.</td></tr>'
+        daily_rows = "".join(
+            f"<tr><td>{day}</td><td>{html.escape(backend)}</td><td>{requests}</td><td>{self._size(size)}</td></tr>"
+            for day, backend, requests, size in stats
+        ) or '<tr><td colspan="4" class="muted">داده‌ای وجود ندارد.</td></tr>'
+        body = f'''<section class="grid"><div class="card metric"><span>دانلود ۳۰ روز</span><b>{total_requests}</b></div><div class="card metric"><span>ترافیک تقریبی</span><b>{self._size(total_bytes)}</b></div><div class="card metric"><span>فضاهای درگیر</span><b>{len(backend_totals)}</b></div></section><section class="two"><div class="card"><h2>مصرف بر اساس فضا</h2><div class="table-wrap"><table><thead><tr><th>فضا</th><th>درخواست</th><th>ترافیک</th></tr></thead><tbody>{backend_rows}</tbody></table></div></div><div class="card"><h2>جزئیات روزانه</h2><div class="table-wrap"><table><thead><tr><th>روز</th><th>فضا</th><th>درخواست</th><th>ترافیک</th></tr></thead><tbody>{daily_rows}</tbody></table></div></div></section><section class="card"><p class="muted">ترافیک بر اساس حجم فایل هنگام صدور لینک دانلود محاسبه می‌شود؛ قطع دانلود توسط کاربر از سمت S3 قابل اندازه‌گیری دقیق نیست.</p></section>'''
+        return self.page(body, "reports", True)
 
     async def settings_page(self, request: web.Request) -> web.Response:
         session = self.session(request)

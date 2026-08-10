@@ -42,6 +42,7 @@ async def create_offsite_backup(
         await manager.upload_to(
             backend_name, archive, object_key, "application/gzip"
         )
+        await manager.prune_prefix(backend_name, "system-backups/", keep=7)
         await storage.set_setting("last_offsite_backup_at", str(int(datetime.now().timestamp())))
         await storage.set_setting("last_offsite_backup_status", f"ok:{backend_name}:{digest}")
         return object_key

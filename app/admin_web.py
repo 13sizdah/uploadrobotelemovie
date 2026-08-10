@@ -43,6 +43,8 @@ class AdminWeb:
         app.router.add_get("/manage/", self.index)
         app.router.add_get("/manage/files", self.files_page)
         app.router.add_get("/manage/storage", self.storage_page)
+        app.router.add_get("/manage/storage/routing", self.storage_routing_page)
+        app.router.add_get("/manage/storage/new", self.storage_add_page)
         app.router.add_get("/manage/jobs", self.jobs_page)
         app.router.add_get("/manage/system", self.system_page)
         app.router.add_get("/manage/audit", self.audit_page)
@@ -111,6 +113,7 @@ class AdminWeb:
         markup = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><meta name="theme-color" content="#07130f"><title>داشبورد ربات فایل</title><style>
         :root{{--bg:#07130f;--surface:#0d1d17;--surface-2:#11251d;--line:#234137;--text:#f5fbf8;--muted:#94aea3;--brand:#58e2ae;--brand-2:#20ba85;--danger:#ff8f91;--warn:#f7c56b;--shadow:0 22px 65px #02080666}}*{{box-sizing:border-box}}html{{color-scheme:dark}}body{{margin:0;min-height:100vh;background:var(--bg);color:var(--text);font:15px/1.8 Tahoma,"Segoe UI",sans-serif}}body:before{{content:"";position:fixed;inset:0;pointer-events:none;background:radial-gradient(circle at 80% 0,#154b3866,transparent 32%),radial-gradient(circle at 5% 95%,#103a4b44,transparent 28%)}}a{{color:#85efd0;text-decoration:none}}.app-body{{display:grid;grid-template-columns:250px minmax(0,1fr);direction:rtl}}aside{{position:sticky;top:0;height:100vh;padding:24px 17px;border-left:1px solid var(--line);background:#091711e8;backdrop-filter:blur(18px);z-index:3}}.brand{{display:flex;align-items:center;gap:12px;padding:4px 10px 26px;border-bottom:1px solid var(--line)}}.brand-mark{{display:grid;place-items:center;width:42px;height:42px;border-radius:13px;background:linear-gradient(145deg,var(--brand),var(--brand-2));color:#052018;font-size:24px;font-weight:bold;box-shadow:0 10px 28px #36d9a43d}}.brand b,.brand small{{display:block}}.brand b{{font-size:18px;letter-spacing:.3px}}.brand small{{color:var(--muted);font-size:11px}}nav{{display:flex;flex-direction:column;gap:5px;margin-top:24px}}nav a{{display:flex;align-items:center;gap:12px;padding:11px 13px;color:var(--muted);border:1px solid transparent;border-radius:12px;transition:.18s ease}}nav a i{{display:grid;place-items:center;width:27px;height:27px;font-style:normal;font-size:18px}}nav a:hover{{color:white;background:#10281f}}nav a.active{{color:white;background:linear-gradient(100deg,#173c2e,#10291f);border-color:#2c5b49;box-shadow:inset -3px 0 var(--brand)}}.side-status{{position:absolute;bottom:22px;right:17px;left:17px;display:flex;align-items:center;gap:10px;padding:12px;background:#0d2119;border:1px solid var(--line);border-radius:13px}}.side-status>span,.live i{{width:9px;height:9px;border-radius:50%;background:var(--brand);box-shadow:0 0 0 5px #58e2ae1c}}.side-status b,.side-status small{{display:block}}.side-status b{{font-size:12px}}.side-status small{{color:var(--muted);font-size:10px}}.content{{min-width:0;padding:30px 34px 50px}}.topbar{{display:flex;align-items:center;justify-content:space-between;gap:20px;max-width:1320px;margin:0 auto 25px}}.topbar p{{margin:0;color:var(--brand);font-size:12px}}.topbar h1{{margin:2px 0 0;font-size:25px;line-height:1.4}}.live{{display:flex;align-items:center;gap:9px;padding:7px 12px;border:1px solid #2c5848;background:#10271e;border-radius:99px;font-size:12px}}main{{max-width:1320px;margin:auto}}.grid{{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:15px}}.two{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:15px}}.card{{position:relative;background:linear-gradient(145deg,#10251d,#0b1b15);border:1px solid var(--line);border-radius:18px;padding:21px;margin:0 0 15px;box-shadow:var(--shadow);overflow:hidden}}.card:after{{content:"";position:absolute;inset:0;pointer-events:none;background:linear-gradient(120deg,#ffffff05,transparent 28%)}}.metric{{min-height:134px}}.metric:before{{content:"";position:absolute;width:75px;height:75px;left:-20px;top:-22px;border-radius:50%;background:#58e2ae10}}.metric b{{display:block;margin-top:16px;font-size:28px;line-height:1.2;color:white;direction:ltr;text-align:right}}.metric span,.muted{{color:var(--muted)}}h2,h3{{margin:0 0 12px;line-height:1.45}}h2{{font-size:18px}}p{{margin:7px 0}}label{{display:block;margin:13px 0 6px;color:#b9d0c7;font-size:13px}}input,select{{width:100%;min-height:46px;border:1px solid #315347;border-radius:11px;background:#07150f;color:white;padding:10px 12px;direction:ltr;transition:.18s}}input:hover,select:hover{{border-color:#477361}}input:focus,select:focus{{border-color:var(--brand);box-shadow:0 0 0 3px #58e2ae1a;outline:0}}button{{position:relative;min-height:43px;border:0;border-radius:11px;background:linear-gradient(120deg,var(--brand),#39ce99);color:#052019;font-weight:bold;padding:9px 17px;margin-top:14px;cursor:pointer;transition:.18s;z-index:1}}button:hover{{transform:translateY(-1px);filter:brightness(1.06)}}button.danger{{background:#55282c;color:#ffc6c7;border:1px solid #844148}}button.secondary{{background:#19362a;color:#d9eee6;border:1px solid #315646}}button:focus-visible,a:focus-visible{{outline:3px solid #9ff5da;outline-offset:3px}}.row{{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px}}.ok{{color:#6ce5b6}}.bad{{color:var(--danger)}}.table-wrap{{overflow:auto;border:1px solid var(--line);border-radius:13px;margin-top:16px}}table{{width:100%;border-collapse:collapse;min-width:720px;background:#091912}}th,td{{text-align:right;padding:12px 14px;border-bottom:1px solid #1e392f}}th{{color:#a7c3b8;font-size:12px;background:#10241c}}tr:last-child td{{border-bottom:0}}tr:hover td{{background:#10241c88}}code{{direction:ltr;display:inline-block;color:#c7f5e5}}.badge{{display:inline-flex;padding:3px 10px;border:1px solid #2c5b49;border-radius:99px;background:#17382b;color:#9cf0d1;font-size:12px}}form.inline{{display:inline}}form.inline button{{margin:0;min-height:34px;padding:5px 10px}}.quick-links a{{display:block;padding:13px;border:1px solid var(--line);border-radius:11px;background:#0a1913}}.progress{{height:8px;background:#07140f;border-radius:10px;overflow:hidden;margin-top:14px}}.progress span{{display:block;height:100%;border-radius:inherit;background:linear-gradient(90deg,var(--brand-2),var(--brand))}}.login-body{{display:grid;place-items:center;padding:24px;overflow:hidden}}.login-shell{{width:min(100%,440px);position:relative;z-index:1}}.login-card{{padding:34px;border-radius:24px;background:#0c1d16e8;box-shadow:0 30px 100px #0009;border:1px solid #315346;backdrop-filter:blur(18px)}}.login-logo{{display:grid;place-items:center;width:58px;height:58px;border-radius:17px;margin-bottom:24px;background:linear-gradient(145deg,var(--brand),var(--brand-2));color:#062019;font-size:30px;font-weight:bold;box-shadow:0 15px 35px #39ce9938}}.login-card h1{{font-size:25px;margin:0 0 5px}}.login-card button{{width:100%;margin-top:20px}}.login-note{{display:flex;align-items:center;gap:8px;margin-top:18px;color:var(--muted);font-size:11px}}.login-note i{{width:7px;height:7px;background:var(--brand);border-radius:50%}}
         @media(max-width:980px){{.app-body{{display:block}}aside{{position:sticky;height:auto;padding:12px 16px;border-left:0;border-bottom:1px solid var(--line)}}.brand{{padding:0 4px 10px;border:0}}.brand small,.side-status{{display:none}}nav{{flex-direction:row;overflow:auto;margin:0;padding-bottom:2px}}nav a{{flex:0 0 auto;padding:8px 11px}}.content{{padding:24px 18px 45px}}.grid{{grid-template-columns:repeat(2,1fr)}}}}@media(max-width:620px){{.topbar{{align-items:flex-start}}.topbar h1{{font-size:20px}}.live{{display:none}}.grid,.two,.row{{grid-template-columns:1fr}}.content{{padding:18px 13px 38px}}.card{{padding:17px;border-radius:15px}}nav a span{{font-size:12px}}.login-card{{padding:26px 21px}}}}
+        .subnav{{display:flex;gap:7px;overflow:auto;margin:0 0 18px;padding:6px;border:1px solid var(--line);border-radius:14px;background:#091912}}.subnav a{{flex:0 0 auto;padding:9px 14px;color:var(--muted);border-radius:9px}}.subnav a:hover{{color:white;background:#10281f}}.subnav a.active{{color:#062019;background:linear-gradient(120deg,var(--brand),#39ce99);font-weight:bold}}
         </style></head><body class="{body_class}">{layout}</body></html>"""
         response = web.Response(text=markup, content_type="text/html", charset="utf-8")
         response.headers.update({
@@ -123,12 +126,22 @@ class AdminWeb:
     def login_page(self, message: str = "برای دسترسی به مرکز کنترل، رمز مدیر را وارد کنید.") -> web.Response:
         return self.page(f'''<section class="login-card"><div class="login-logo">↑</div><h1>ورود به FileFlow</h1><p class="muted">{html.escape(message)}</p><form method="post" action="/manage/login"><label for="password">رمز عبور</label><input id="password" name="password" type="password" autocomplete="current-password" placeholder="••••••••••••" autofocus required><button>ورود امن به داشبورد</button></form><div class="login-note"><i></i><span>نشست امن و محدود به ۳۰ دقیقه</span></div></section>''')
 
+    @staticmethod
+    def storage_tabs(active: str) -> str:
+        tabs = (
+            ("list", "/manage/storage", "فضاهای متصل"),
+            ("routing", "/manage/storage/routing", "مسیر فایل‌های جدید"),
+            ("new", "/manage/storage/new", "افزودن فضای جدید"),
+        )
+        return '<div class="subnav">' + "".join(
+            f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
+            for key, url, label in tabs
+        ) + "</div>"
+
     async def storage_page(self, request: web.Request) -> web.Response:
         session = self.session(request)
         if not session:
             return self.login_page()
-        mode = await self.storage.get_setting("storage_backend", "local")
-        replication_count = await self.storage.get_setting("replication_count", "1")
         pending_replications = await self.storage.pending_replication_count()
         backend_usage = await self.storage.backend_usage()
         cards_parts: list[str] = []
@@ -148,8 +161,24 @@ class AdminWeb:
             f'<section class="card"><p>کارهای replication در صف: <b>{pending_replications}</b></p></section>'
             + ("".join(cards_parts) or '<p class="muted">هنوز فضای S3 ثبت نشده است.</p>')
         )
+        return self.page(self.storage_tabs("list") + cards, "storage", True)
+
+    async def storage_routing_page(self, request: web.Request) -> web.Response:
+        session = self.session(request)
+        if not session:
+            raise web.HTTPFound("/manage/")
+        mode = await self.storage.get_setting("storage_backend", "local")
+        replication_count = await self.storage.get_setting("replication_count", "1")
         migration_status = html.escape(self.migration_status)
-        return self.page(f'''<section class="card"><h2>مسیر فایل‌های جدید</h2><p>حالت فعلی: <b>{html.escape(mode)}</b></p><form method="post" action="/manage/storage/mode"><input type="hidden" name="csrf" value="{session.csrf}"><select name="mode"><option value="s3">S3 هوشمند</option><option value="local">دیسک محلی</option></select><button>اعمال حالت</button></form><form method="post" action="/manage/storage/replication"><input type="hidden" name="csrf" value="{session.csrf}"><label>تعداد کل نسخه‌های هر فایل</label><input name="count" type="number" value="{html.escape(replication_count)}" min="1" max="5"><button>ذخیره تعداد نسخه‌ها</button></form></section>''' + cards + f'''<section class="card"><h2>انتقال فایل‌های قدیمی</h2><p class="muted">فایل‌های فعال روی دیسک، پس از آپلود موفق و ثبت در دیتابیس به S3 منتقل می‌شوند. نسخه محلی فقط در پایان هر انتقال پاک می‌شود.</p><p>{migration_status}</p><form method="post" action="/manage/storage/migrate"><input type="hidden" name="csrf" value="{session.csrf}"><button>شروع انتقال امن به S3</button></form></section><section class="card"><h2>افزودن فضای جدید</h2><form method="post" action="/manage/storage/add"><input type="hidden" name="csrf" value="{session.csrf}"><div class="row"><div><label>نام یکتا</label><input name="name" required></div><div><label>Region</label><input name="region" value="auto" required></div></div><label>Endpoint HTTPS</label><input name="endpoint_url" type="url" required><label>Bucket</label><input name="bucket" required><div class="row"><div><label>Access Key</label><input name="access_key_id" required></div><div><label>Secret Key</label><input name="secret_access_key" type="password" required></div></div><div class="row"><div><label>ظرفیت قابل استفاده (GB، صفر=نامحدود)</label><input name="capacity_gb" type="number" value="0" min="0" step="0.1"></div><div><label>فضای رزرو (GB)</label><input name="reserve_gb" type="number" value="0" min="0" step="0.1"></div></div><label>اولویت (عدد کمتر بهتر)</label><input name="priority" type="number" value="100" min="1" max="9999"><button>تست اتصال و ذخیره</button></form></section><form method="post" action="/manage/logout"><input type="hidden" name="csrf" value="{session.csrf}"><button>خروج</button></form>''')
+        body = f'''{self.storage_tabs("routing")}<section class="card"><h2>مسیر فایل‌های جدید</h2><p class="muted">مقصد اصلی فایل‌ها و تعداد نسخه‌های پشتیبان را تعیین کنید.</p><p>حالت فعلی: <span class="badge">{html.escape(mode)}</span></p><form method="post" action="/manage/storage/mode"><input type="hidden" name="csrf" value="{session.csrf}"><label>مقصد فایل‌ها</label><select name="mode"><option value="s3">S3 هوشمند</option><option value="local">دیسک محلی</option></select><button>اعمال مسیر</button></form><form method="post" action="/manage/storage/replication"><input type="hidden" name="csrf" value="{session.csrf}"><label>تعداد کل نسخه‌های هر فایل</label><input name="count" type="number" value="{html.escape(replication_count)}" min="1" max="5"><button>ذخیره تعداد نسخه‌ها</button></form></section><section class="card"><h2>انتقال فایل‌های قدیمی</h2><p class="muted">فایل‌های محلی پس از آپلود موفق و ثبت در دیتابیس به S3 منتقل می‌شوند.</p><p>{migration_status}</p><form method="post" action="/manage/storage/migrate"><input type="hidden" name="csrf" value="{session.csrf}"><button>شروع انتقال امن به S3</button></form></section>'''
+        return self.page(body, "storage", True)
+
+    async def storage_add_page(self, request: web.Request) -> web.Response:
+        session = self.session(request)
+        if not session:
+            raise web.HTTPFound("/manage/")
+        body = f'''{self.storage_tabs("new")}<section class="card"><h2>افزودن فضای جدید</h2><p class="muted">یک سرویس S3-compatible جدید ثبت کنید. قبل از ذخیره، اتصال و Bucket آزمایش می‌شوند.</p><form method="post" action="/manage/storage/add"><input type="hidden" name="csrf" value="{session.csrf}"><div class="row"><div><label>نام یکتا</label><input name="name" placeholder="bunny-frankfurt" required></div><div><label>Region</label><input name="region" value="auto" required></div></div><label>S3 Endpoint HTTPS</label><input name="endpoint_url" type="url" placeholder="https://s3.example.com" required><label>Bucket</label><input name="bucket" required><div class="row"><div><label>Access Key</label><input name="access_key_id" autocomplete="off" required></div><div><label>Secret Key</label><input name="secret_access_key" type="password" autocomplete="new-password" required></div></div><div class="row"><div><label>ظرفیت قابل استفاده (GB، صفر=نامحدود)</label><input name="capacity_gb" type="number" value="0" min="0" step="0.1"></div><div><label>فضای رزرو (GB)</label><input name="reserve_gb" type="number" value="0" min="0" step="0.1"></div></div><label>اولویت (عدد کمتر بهتر)</label><input name="priority" type="number" value="100" min="1" max="9999"><button>تست اتصال و ذخیره</button></form></section>'''
+        return self.page(body, "storage", True)
 
     async def index(self, request: web.Request) -> web.Response:
         session = self.session(request)
@@ -385,7 +414,7 @@ class AdminWeb:
         await self.store.save(configs)
         self.manager.replace_configs(configs)
         await self.storage.set_setting("storage_backend", "s3")
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage")
 
     async def set_storage_mode(self, request: web.Request) -> web.Response:
         _, data = await self.require_form_session(request)
@@ -395,7 +424,7 @@ class AdminWeb:
         if mode == "s3" and not self.manager.backends:
             return self.page('<section class="card"><p class="bad">ابتدا یک فضای S3 سالم اضافه کنید.</p></section>')
         await self.storage.set_setting("storage_backend", mode)
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage/routing")
 
     async def set_replication(self, request: web.Request) -> web.Response:
         _, data = await self.require_form_session(request)
@@ -406,7 +435,7 @@ class AdminWeb:
         if not 1 <= count <= 5:
             raise web.HTTPBadRequest(text="Replication count must be between 1 and 5")
         await self.storage.set_setting("replication_count", str(count))
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage/routing")
 
     async def _save_backend_configs(self, configs: list[dict[str, object]]) -> None:
         await self.store.save(configs)
@@ -424,7 +453,7 @@ class AdminWeb:
         await self._save_backend_configs(configs)
         if not any(item.enabled for item in self.manager.backends.values()):
             await self.storage.set_setting("storage_backend", "local")
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage")
 
     async def set_storage_priority(self, request: web.Request) -> web.Response:
         _, data = await self.require_form_session(request)
@@ -442,7 +471,7 @@ class AdminWeb:
             if config["name"] == name:
                 config["priority"] = priority
         await self._save_backend_configs(configs)
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage")
 
     async def set_storage_capacity(self, request: web.Request) -> web.Response:
         _, data = await self.require_form_session(request)
@@ -462,7 +491,7 @@ class AdminWeb:
                 config["capacity_bytes"] = int(capacity_gb * 1024 ** 3)
                 config["reserve_bytes"] = int(reserve_gb * 1024 ** 3)
         await self._save_backend_configs(configs)
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage")
 
     async def delete_storage(self, request: web.Request) -> web.Response:
         _, data = await self.require_form_session(request)
@@ -478,17 +507,17 @@ class AdminWeb:
         await self._save_backend_configs(configs)
         if not any(item.enabled for item in self.manager.backends.values()):
             await self.storage.set_setting("storage_backend", "local")
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage")
 
     async def start_migration(self, request: web.Request) -> web.Response:
         await self.require_form_session(request)
         if not self.manager.backends:
             return self.page('<section class="card"><p class="bad">ابتدا حداقل یک فضای S3 اضافه کنید.</p></section>')
         if self.migration_task and not self.migration_task.done():
-            raise web.HTTPFound("/manage/")
+            raise web.HTTPFound("/manage/storage/routing")
         self.migration_status = "در حال آماده‌سازی فهرست فایل‌ها…"
         self.migration_task = asyncio.create_task(self._migrate_local_files())
-        raise web.HTTPFound("/manage/")
+        raise web.HTTPFound("/manage/storage/routing")
 
     async def _migrate_local_files(self) -> None:
         migrated = 0

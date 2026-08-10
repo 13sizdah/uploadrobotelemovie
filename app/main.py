@@ -941,6 +941,21 @@ async def create_app(settings: Settings) -> None:
             encrypted_config,
             storage,
         ).install(web_app)
+    else:
+        async def admin_not_configured(_: web.Request) -> web.Response:
+            return web.Response(
+                text=(
+                    "پنل مدیریت فعال نشده است. متغیر ADMIN_WEB_PASSWORD_HASH را "
+                    "در فایل .env تنظیم و کانتینر file-link-bot را بازسازی کنید."
+                ),
+                status=503,
+                content_type="text/plain",
+                charset="utf-8",
+                headers={"Cache-Control": "no-store"},
+            )
+
+        web_app.router.add_get("/manage", admin_not_configured)
+        web_app.router.add_get("/manage/", admin_not_configured)
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, settings.host, settings.port)

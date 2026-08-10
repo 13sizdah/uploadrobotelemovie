@@ -21,4 +21,4 @@ encoded = "pbkdf2_sha256${}${}${}".format(
     base64.urlsafe_b64encode(digest).decode(),
 )
 print("\nاین خط را در .env قرار دهید:\n")
-print(f'ADMIN_WEB_PASSWORD_HASH="{encoded}"')
+print(f"ADMIN_WEB_PASSWORD_HASH='{encoded}'")

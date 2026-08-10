@@ -195,7 +195,7 @@ class Storage:
                 "SELECT backend_name, object_key FROM file_replicas WHERE token = ?",
                 (token,),
             )
-        return await cursor.fetchall()
+            return await cursor.fetchall()
 
     async def backend_reference_count(self, backend_name: str) -> int:
         async with aiosqlite.connect(self.db_path) as db:

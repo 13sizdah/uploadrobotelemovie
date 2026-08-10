@@ -48,6 +48,10 @@ else
   cp "${PROJECT_DIR}/data/files.sqlite3" "${TMP_DIR}/data/" 2>/dev/null || true
   cp "${PROJECT_DIR}/data/files.sqlite3-wal" "${TMP_DIR}/data/" 2>/dev/null || true
   cp "${PROJECT_DIR}/data/files.sqlite3-shm" "${TMP_DIR}/data/" 2>/dev/null || true
+  # These two files are a pair. Without them, S3 credentials configured in
+  # the web panel cannot be decrypted after migration to a new server.
+  cp "${PROJECT_DIR}/data/config.key" "${TMP_DIR}/data/" 2>/dev/null || true
+  cp "${PROJECT_DIR}/data/s3-backends.enc" "${TMP_DIR}/data/" 2>/dev/null || true
   tar -C "${TMP_DIR}" -cf "${ARCHIVE}" .env compose.yaml data
 fi
 
@@ -66,5 +70,5 @@ find "${BACKUP_DIR}" -maxdepth 1 -type f \
 echo "بکاپ ساخته شد: ${ARCHIVE}"
 echo "Checksum: ${CHECKSUM}"
 if [[ "${MODE}" == "metadata" ]]; then
-  echo "توجه: این بکاپ فایل‌های آپلودشده را شامل نمی‌شود."
+  echo "توجه: این بکاپ فایل‌های آپلودشده را شامل نمی‌شود، اما تنظیمات رمزشده S3 را شامل می‌شود."
 fi

@@ -174,6 +174,7 @@ async def create_app(settings: Settings) -> None:
             if object_storage:
                 for backend_name, object_key in await storage.replicas_for(item.token):
                     await object_storage.delete(backend_name, object_key)
+            await storage.delete_stored_file(item.stored_name)
             await storage.delete_record(item.token)
             return True
         except Exception:
@@ -624,7 +625,8 @@ async def create_app(settings: Settings) -> None:
         original_name = safe_filename(media.file_name)
         uploaded_backend: str | None = None
         object_key: str | None = None
-        uploaded_replicas: list[tuple[str, str]] = []
+        replication_targets: list[tuple[str, str]] = []
+        record_saved = False
         try:
             actual_size = await download_with_progress(
                 media.downloadable,
@@ -669,8 +671,9 @@ async def create_app(settings: Settings) -> None:
 
                 cloud_task = asyncio.create_task(cloud_progress_updates())
                 try:
+                    backend_usage = await storage.backend_usage()
                     backend_name = await object_storage.upload(
-                        destination, object_key, media.mime_type, cloud_progress
+                        destination, object_key, media.mime_type, cloud_progress, backend_usage
                     )
                     uploaded_backend = backend_name
                 finally:
@@ -685,39 +688,41 @@ async def create_app(settings: Settings) -> None:
                 )
                 if replication_count > 1:
                     await status.edit_text(
-                        f"در حال ساخت {replication_count - 1} نسخه پشتیبان در فضاهای دیگر…"
+                        "نسخه اصلی ثبت شد؛ replicaها در صف پایدار قرار می‌گیرند…"
                     )
-                    uploaded_replicas = await object_storage.replicate(
-                        destination,
-                        object_key,
-                        media.mime_type,
-                        backend_name,
-                        replication_count,
-                    )
-                await storage.delete_stored_file(stored_name)
+                    replication_targets = [
+                        (target, object_key)
+                        for target in object_storage.replication_targets(
+                            backend_name,
+                            replication_count,
+                            actual_size,
+                            backend_usage,
+                        )
+                    ]
             expires_at = int(time.time()) + settings.file_ttl_hours * 3600
-            await storage.add_with_replicas(
-                StoredFile(
-                    token=token,
-                    stored_name=stored_name,
-                    original_name=original_name,
-                    mime_type=media.mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
-                    size=actual_size,
-                    expires_at=expires_at,
-                    backend_name=backend_name,
-                    object_key=object_key,
-                ),
-                uploaded_replicas,
+            item = StoredFile(
+                token=token,
+                stored_name=stored_name,
+                original_name=original_name,
+                mime_type=media.mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
+                size=actual_size,
+                expires_at=expires_at,
+                backend_name=backend_name,
+                object_key=object_key,
             )
+            if backend_name == "local":
+                await storage.add(item)
+            else:
+                await storage.add_with_replication_jobs(item, replication_targets)
+                if not replication_targets:
+                    await storage.delete_stored_file(stored_name)
+            record_saved = True
         except Exception:
             logger.exception("Could not save Telegram file")
             await storage.delete_stored_file(stored_name)
-            if uploaded_backend and object_key:
+            if not record_saved and uploaded_backend and object_key:
                 with suppress(Exception):
                     await object_storage.delete(uploaded_backend, object_key)
-            for replica_backend, replica_key in uploaded_replicas:
-                with suppress(Exception):
-                    await object_storage.delete(replica_backend, replica_key)
             await status.edit_text("❌ دریافت فایل ناموفق بود. لطفاً دوباره تلاش کنید.")
             return
 
@@ -981,17 +986,60 @@ async def create_app(settings: Settings) -> None:
                 logger.exception("S3 health check cycle failed")
             await asyncio.sleep(60)
 
+    async def replication_loop() -> None:
+        while True:
+            try:
+                jobs = await storage.due_replication_jobs(limit=5)
+                if not jobs:
+                    await asyncio.sleep(5)
+                    continue
+                for job in jobs:
+                    item = await storage.get(job.token)
+                    if item is None or not item.object_key:
+                        continue
+                    source = storage.path_for(item.stored_name)
+                    try:
+                        if not source.is_file():
+                            await object_storage.download_to(
+                                item.backend_name, item.object_key, source
+                            )
+                        await object_storage.upload_to(
+                            job.target_backend, source, job.object_key, item.mime_type
+                        )
+                        await storage.complete_replication_job(job)
+                        logger.info(
+                            "Replication completed for %s to %s",
+                            job.token,
+                            job.target_backend,
+                        )
+                        if await storage.pending_replication_count(job.token) == 0:
+                            await storage.delete_stored_file(item.stored_name)
+                    except Exception as exc:
+                        logger.exception(
+                            "Replication job %s failed for backend %s",
+                            job.id,
+                            job.target_backend,
+                        )
+                        await storage.fail_replication_job(job, type(exc).__name__)
+            except Exception:
+                logger.exception("Replication worker cycle failed")
+                await asyncio.sleep(5)
+
     cleanup_task = asyncio.create_task(cleanup_loop())
     health_task = asyncio.create_task(storage_health_loop())
+    replication_task = asyncio.create_task(replication_loop())
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         cleanup_task.cancel()
         health_task.cancel()
+        replication_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
         with suppress(asyncio.CancelledError):
             await health_task
+        with suppress(asyncio.CancelledError):
+            await replication_task
         await runner.cleanup()
         await bot.session.close()
 

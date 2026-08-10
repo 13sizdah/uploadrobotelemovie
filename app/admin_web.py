@@ -44,6 +44,7 @@ class AdminWeb:
         app.router.add_post("/manage/storage/migrate", self.start_migration)
         app.router.add_post("/manage/storage/toggle", self.toggle_storage)
         app.router.add_post("/manage/storage/priority", self.set_storage_priority)
+        app.router.add_post("/manage/storage/capacity", self.set_storage_capacity)
         app.router.add_post("/manage/storage/delete", self.delete_storage)
 
     async def redirect_to_index(self, _: web.Request) -> web.Response:
@@ -76,19 +77,27 @@ class AdminWeb:
             return self.page('<section class="card"><h2>ورود مدیر</h2><form method="post" action="/manage/login"><label for="password">رمز عبور</label><input id="password" name="password" type="password" autocomplete="current-password" required><button>ورود امن</button></form></section>')
         mode = await self.storage.get_setting("storage_backend", "local")
         replication_count = await self.storage.get_setting("replication_count", "1")
+        pending_replications = await self.storage.pending_replication_count()
+        backend_usage = await self.storage.backend_usage()
         cards_parts: list[str] = []
         for item in self.manager.backends.values():
             name = html.escape(item.name)
             refs = await self.storage.backend_reference_count(item.name)
+            usage = backend_usage.get(item.name, 0)
+            used_gb = usage / (1024 ** 3)
+            capacity_gb = item.capacity_bytes / (1024 ** 3) if item.capacity_bytes else 0
             healthy = item.unhealthy_until <= time.monotonic()
             state_class = "ok" if item.enabled and healthy else "bad"
             state = "فعال و سالم" if item.enabled and healthy else ("غیرفعال برای آپلود" if not item.enabled else "موقتاً ناسالم")
             cards_parts.append(
-                f'''<section class="card"><h2>{name}</h2><p>Bucket: <b>{html.escape(item.bucket)}</b></p><p>Endpoint: {html.escape(item.endpoint_url)}</p><p>Region: {html.escape(item.region)}</p><p>Latency: {item.latency_ms:.0f} ms | خطا: {item.failures} | ارجاع فایل: {refs}</p><p class="{state_class}">{state}</p><div class="row"><form method="post" action="/manage/storage/priority"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><label>اولویت</label><input name="priority" type="number" value="{item.priority}" min="1" max="9999"><button>ذخیره اولویت</button></form><form method="post" action="/manage/storage/toggle"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><button>{'غیرفعال‌کردن آپلود' if item.enabled else 'فعال‌کردن آپلود'}</button></form></div><form method="post" action="/manage/storage/delete"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><button class="danger">حذف تنظیمات این فضا</button></form></section>'''
+                f'''<section class="card"><h2>{name}</h2><p>Bucket: <b>{html.escape(item.bucket)}</b></p><p>Endpoint: {html.escape(item.endpoint_url)}</p><p>Region: {html.escape(item.region)}</p><p>مصرف ثبت‌شده: {used_gb:.2f} GB از {'نامحدود' if not capacity_gb else f'{capacity_gb:.2f} GB'}</p><p>Latency: {item.latency_ms:.0f} ms | خطا: {item.failures} | ارجاع فایل: {refs}</p><p class="{state_class}">{state}</p><form method="post" action="/manage/storage/capacity"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><div class="row"><div><label>ظرفیت قابل استفاده (GB، صفر=نامحدود)</label><input name="capacity_gb" type="number" value="{capacity_gb:.2f}" min="0" step="0.1"></div><div><label>فضای رزرو (GB)</label><input name="reserve_gb" type="number" value="{item.reserve_bytes / (1024 ** 3):.2f}" min="0" step="0.1"></div></div><button>ذخیره ظرفیت</button></form><div class="row"><form method="post" action="/manage/storage/priority"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><label>اولویت</label><input name="priority" type="number" value="{item.priority}" min="1" max="9999"><button>ذخیره اولویت</button></form><form method="post" action="/manage/storage/toggle"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><button>{'غیرفعال‌کردن آپلود' if item.enabled else 'فعال‌کردن آپلود'}</button></form></div><form method="post" action="/manage/storage/delete"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="name" value="{name}"><button class="danger">حذف تنظیمات این فضا</button></form></section>'''
             )
-        cards = "".join(cards_parts) or '<p class="muted">هنوز فضای S3 ثبت نشده است.</p>'
+        cards = (
+            f'<section class="card"><p>کارهای replication در صف: <b>{pending_replications}</b></p></section>'
+            + ("".join(cards_parts) or '<p class="muted">هنوز فضای S3 ثبت نشده است.</p>')
+        )
         migration_status = html.escape(self.migration_status)
-        return self.page(f'''<section class="card"><h2>مسیر فایل‌های جدید</h2><p>حالت فعلی: <b>{html.escape(mode)}</b></p><form method="post" action="/manage/storage/mode"><input type="hidden" name="csrf" value="{session.csrf}"><select name="mode"><option value="s3">S3 هوشمند</option><option value="local">دیسک محلی</option></select><button>اعمال حالت</button></form><form method="post" action="/manage/storage/replication"><input type="hidden" name="csrf" value="{session.csrf}"><label>تعداد کل نسخه‌های هر فایل</label><input name="count" type="number" value="{html.escape(replication_count)}" min="1" max="5"><button>ذخیره تعداد نسخه‌ها</button></form></section>''' + cards + f'''<section class="card"><h2>انتقال فایل‌های قدیمی</h2><p class="muted">فایل‌های فعال روی دیسک، پس از آپلود موفق و ثبت در دیتابیس به S3 منتقل می‌شوند. نسخه محلی فقط در پایان هر انتقال پاک می‌شود.</p><p>{migration_status}</p><form method="post" action="/manage/storage/migrate"><input type="hidden" name="csrf" value="{session.csrf}"><button>شروع انتقال امن به S3</button></form></section><section class="card"><h2>افزودن فضای جدید</h2><form method="post" action="/manage/storage/add"><input type="hidden" name="csrf" value="{session.csrf}"><div class="row"><div><label>نام یکتا</label><input name="name" required></div><div><label>Region</label><input name="region" value="auto" required></div></div><label>Endpoint HTTPS</label><input name="endpoint_url" type="url" required><label>Bucket</label><input name="bucket" required><div class="row"><div><label>Access Key</label><input name="access_key_id" required></div><div><label>Secret Key</label><input name="secret_access_key" type="password" required></div></div><label>اولویت (عدد کمتر بهتر)</label><input name="priority" type="number" value="100" min="1" max="9999"><button>تست اتصال و ذخیره</button></form></section><form method="post" action="/manage/logout"><input type="hidden" name="csrf" value="{session.csrf}"><button>خروج</button></form>''')
+        return self.page(f'''<section class="card"><h2>مسیر فایل‌های جدید</h2><p>حالت فعلی: <b>{html.escape(mode)}</b></p><form method="post" action="/manage/storage/mode"><input type="hidden" name="csrf" value="{session.csrf}"><select name="mode"><option value="s3">S3 هوشمند</option><option value="local">دیسک محلی</option></select><button>اعمال حالت</button></form><form method="post" action="/manage/storage/replication"><input type="hidden" name="csrf" value="{session.csrf}"><label>تعداد کل نسخه‌های هر فایل</label><input name="count" type="number" value="{html.escape(replication_count)}" min="1" max="5"><button>ذخیره تعداد نسخه‌ها</button></form></section>''' + cards + f'''<section class="card"><h2>انتقال فایل‌های قدیمی</h2><p class="muted">فایل‌های فعال روی دیسک، پس از آپلود موفق و ثبت در دیتابیس به S3 منتقل می‌شوند. نسخه محلی فقط در پایان هر انتقال پاک می‌شود.</p><p>{migration_status}</p><form method="post" action="/manage/storage/migrate"><input type="hidden" name="csrf" value="{session.csrf}"><button>شروع انتقال امن به S3</button></form></section><section class="card"><h2>افزودن فضای جدید</h2><form method="post" action="/manage/storage/add"><input type="hidden" name="csrf" value="{session.csrf}"><div class="row"><div><label>نام یکتا</label><input name="name" required></div><div><label>Region</label><input name="region" value="auto" required></div></div><label>Endpoint HTTPS</label><input name="endpoint_url" type="url" required><label>Bucket</label><input name="bucket" required><div class="row"><div><label>Access Key</label><input name="access_key_id" required></div><div><label>Secret Key</label><input name="secret_access_key" type="password" required></div></div><div class="row"><div><label>ظرفیت قابل استفاده (GB، صفر=نامحدود)</label><input name="capacity_gb" type="number" value="0" min="0" step="0.1"></div><div><label>فضای رزرو (GB)</label><input name="reserve_gb" type="number" value="0" min="0" step="0.1"></div></div><label>اولویت (عدد کمتر بهتر)</label><input name="priority" type="number" value="100" min="1" max="9999"><button>تست اتصال و ذخیره</button></form></section><form method="post" action="/manage/logout"><input type="hidden" name="csrf" value="{session.csrf}"><button>خروج</button></form>''')
 
     async def login(self, request: web.Request) -> web.Response:
         ip = request.remote or "unknown"
@@ -134,14 +143,20 @@ class AdminWeb:
             return self.page('<section class="card"><p class="bad">این نام قبلاً ثبت شده است.</p></section>')
         try:
             priority = int(data.get("priority", "100"))
+            capacity_gb = float(data.get("capacity_gb", "0"))
+            reserve_gb = float(data.get("reserve_gb", "0"))
         except ValueError:
-            return self.page('<section class="card"><p class="bad">اولویت معتبر نیست.</p></section>')
+            return self.page('<section class="card"><p class="bad">اولویت یا ظرفیت معتبر نیست.</p></section>')
+        if capacity_gb < 0 or reserve_gb < 0 or (capacity_gb and reserve_gb >= capacity_gb):
+            return self.page('<section class="card"><p class="bad">ظرفیت نامعتبر است یا فضای رزرو از ظرفیت کمتر نیست.</p></section>')
         config: dict[str, object] = {
             "name": data.get("name", ""), "endpoint_url": endpoint,
             "bucket": data.get("bucket", ""), "region": data.get("region", "auto"),
             "access_key_id": data.get("access_key_id", ""),
             "secret_access_key": data.get("secret_access_key", ""),
             "priority": priority, "enabled": True,
+            "capacity_bytes": int(capacity_gb * 1024 ** 3),
+            "reserve_bytes": int(reserve_gb * 1024 ** 3),
         }
         probe = ObjectStorageManager((config,), self.manager.transfer_config.multipart_chunksize // (1024 * 1024), self.manager.presign_seconds)
         backend = next(iter(probe.backends.values()))
@@ -210,6 +225,26 @@ class AdminWeb:
         await self._save_backend_configs(configs)
         raise web.HTTPFound("/manage/")
 
+    async def set_storage_capacity(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        name = data.get("name", "")
+        if name not in self.manager.backends:
+            raise web.HTTPNotFound(text="Storage backend not found")
+        try:
+            capacity_gb = float(data.get("capacity_gb", "0"))
+            reserve_gb = float(data.get("reserve_gb", "0"))
+        except ValueError:
+            raise web.HTTPBadRequest(text="Invalid capacity")
+        if capacity_gb < 0 or reserve_gb < 0 or (capacity_gb and reserve_gb >= capacity_gb):
+            raise web.HTTPBadRequest(text="Reserve must be smaller than capacity")
+        configs = self.manager.export_configs()
+        for config in configs:
+            if config["name"] == name:
+                config["capacity_bytes"] = int(capacity_gb * 1024 ** 3)
+                config["reserve_bytes"] = int(reserve_gb * 1024 ** 3)
+        await self._save_backend_configs(configs)
+        raise web.HTTPFound("/manage/")
+
     async def delete_storage(self, request: web.Request) -> web.Response:
         _, data = await self.require_form_session(request)
         name = data.get("name", "")
@@ -257,10 +292,14 @@ class AdminWeb:
                 registered = False
                 try:
                     self.migration_status = f"در حال انتقال فایل {position} از {total}…"
-                    primary = await self.manager.upload(source, object_key, item.mime_type)
+                    backend_usage = await self.storage.backend_usage()
+                    primary = await self.manager.upload(
+                        source, object_key, item.mime_type, usage=backend_usage
+                    )
                     uploaded.append((primary, object_key))
                     replicas = await self.manager.replicate(
-                        source, object_key, item.mime_type, primary, desired_total
+                        source, object_key, item.mime_type, primary, desired_total,
+                        backend_usage,
                     )
                     uploaded.extend(replicas)
                     await self.storage.mark_migrated_with_replicas(

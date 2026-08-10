@@ -21,6 +21,15 @@ class StoredFile:
     object_key: str | None = None
 
 
+@dataclass(frozen=True)
+class ReplicationJob:
+    id: int
+    token: str
+    target_backend: str
+    object_key: str
+    attempts: int
+
+
 class Storage:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
@@ -70,6 +79,25 @@ class Storage:
                     PRIMARY KEY(token, backend_name),
                     FOREIGN KEY(token) REFERENCES files(token) ON DELETE CASCADE
                 )"""
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS replication_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    token TEXT NOT NULL,
+                    target_backend TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    next_attempt_at INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT NOT NULL DEFAULT '',
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    UNIQUE(token, target_backend),
+                    FOREIGN KEY(token) REFERENCES files(token) ON DELETE CASCADE
+                )"""
+            )
+            await db.execute(
+                "CREATE INDEX IF NOT EXISTS idx_replication_jobs_due "
+                "ON replication_jobs(next_attempt_at, id)"
             )
             await db.commit()
 
@@ -175,6 +203,7 @@ class Storage:
 
     async def delete_record(self, token: str) -> None:
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM replication_jobs WHERE token = ?", (token,))
             await db.execute("DELETE FROM file_replicas WHERE token = ?", (token,))
             await db.execute("DELETE FROM files WHERE token = ?", (token,))
             await db.commit()
@@ -202,9 +231,111 @@ class Storage:
             cursor = await db.execute(
                 """SELECT
                     (SELECT COUNT(*) FROM files WHERE backend_name = ?) +
-                    (SELECT COUNT(*) FROM file_replicas WHERE backend_name = ?)""",
-                (backend_name, backend_name),
+                    (SELECT COUNT(*) FROM file_replicas WHERE backend_name = ?) +
+                    (SELECT COUNT(*) FROM replication_jobs WHERE target_backend = ?)""",
+                (backend_name, backend_name, backend_name),
             )
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def backend_usage(self) -> dict[str, int]:
+        now = int(time.time())
+        usage: dict[str, int] = {}
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT backend_name, COALESCE(SUM(size), 0) FROM files "
+                "WHERE backend_name != 'local' AND expires_at > ? GROUP BY backend_name",
+                (now,),
+            )
+            for backend_name, size in await cursor.fetchall():
+                usage[str(backend_name)] = int(size)
+            cursor = await db.execute(
+                """SELECT r.backend_name, COALESCE(SUM(f.size), 0)
+                   FROM file_replicas r JOIN files f ON f.token = r.token
+                   WHERE f.expires_at > ? GROUP BY r.backend_name""",
+                (now,),
+            )
+            for backend_name, size in await cursor.fetchall():
+                name = str(backend_name)
+                usage[name] = usage.get(name, 0) + int(size)
+            cursor = await db.execute(
+                """SELECT j.target_backend, COALESCE(SUM(f.size), 0)
+                   FROM replication_jobs j JOIN files f ON f.token = j.token
+                   WHERE f.expires_at > ? GROUP BY j.target_backend""",
+                (now,),
+            )
+            for backend_name, size in await cursor.fetchall():
+                name = str(backend_name)
+                usage[name] = usage.get(name, 0) + int(size)
+        return usage
+
+    async def add_with_replication_jobs(
+        self,
+        item: StoredFile,
+        targets: list[tuple[str, str]],
+    ) -> None:
+        now = int(time.time())
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN")
+            await db.execute(
+                """INSERT INTO files
+                (token, stored_name, original_name, mime_type, size, expires_at, backend_name, object_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item.token, item.stored_name, item.original_name, item.mime_type,
+                    item.size, item.expires_at, item.backend_name, item.object_key,
+                ),
+            )
+            if targets:
+                await db.executemany(
+                    """INSERT INTO replication_jobs
+                    (token, target_backend, object_key, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?)""",
+                    [(item.token, backend, key, now, now) for backend, key in targets],
+                )
+            await db.commit()
+
+    async def due_replication_jobs(self, limit: int = 10) -> list[ReplicationJob]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT j.id, j.token, j.target_backend, j.object_key, j.attempts
+                   FROM replication_jobs j JOIN files f ON f.token = j.token
+                   WHERE j.next_attempt_at <= ? AND f.expires_at > ?
+                   ORDER BY j.next_attempt_at, j.id LIMIT ?""",
+                (int(time.time()), int(time.time()), limit),
+            )
+            rows = await cursor.fetchall()
+        return [ReplicationJob(*row) for row in rows]
+
+    async def complete_replication_job(self, job: ReplicationJob) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN")
+            await db.execute(
+                "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
+                (job.token, job.target_backend, job.object_key, int(time.time())),
+            )
+            await db.execute("DELETE FROM replication_jobs WHERE id = ?", (job.id,))
+            await db.commit()
+
+    async def fail_replication_job(self, job: ReplicationJob, error: str) -> None:
+        attempts = job.attempts + 1
+        delay = min(3600, 15 * (2 ** min(attempts, 8)))
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """UPDATE replication_jobs SET attempts = ?, next_attempt_at = ?,
+                   last_error = ?, updated_at = ? WHERE id = ?""",
+                (attempts, int(time.time()) + delay, error[:300], int(time.time()), job.id),
+            )
+            await db.commit()
+
+    async def pending_replication_count(self, token: str | None = None) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            if token is None:
+                cursor = await db.execute("SELECT COUNT(*) FROM replication_jobs")
+            else:
+                cursor = await db.execute(
+                    "SELECT COUNT(*) FROM replication_jobs WHERE token = ?", (token,)
+                )
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
 

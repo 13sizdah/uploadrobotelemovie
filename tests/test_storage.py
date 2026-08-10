@@ -35,6 +35,40 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(migrated.backend_name, "r2")
         self.assertEqual(await self.storage.replicas_for("token"), [("s3", "key")])
 
+    async def test_backend_usage_counts_primary_and_replica_bytes(self) -> None:
+        await self.storage.add_with_replicas(
+            StoredFile("a", "one", "one.bin", "application/octet-stream", 100, 4_000_000_000, "r2", "a"),
+            [("minio", "a")],
+        )
+        await self.storage.add_with_replicas(
+            StoredFile("b", "two", "two.bin", "application/octet-stream", 250, 4_000_000_000, "minio", "b"),
+            [],
+        )
+
+        self.assertEqual(await self.storage.backend_usage(), {"r2": 100, "minio": 350})
+
+    async def test_replication_jobs_survive_and_complete_transactionally(self) -> None:
+        item = StoredFile(
+            "queued", "spool", "movie.mkv", "video/x-matroska",
+            500, 4_000_000_000, "r2", "files/queued",
+        )
+        await self.storage.add_with_replication_jobs(
+            item, [("minio", "files/queued")]
+        )
+
+        jobs = await self.storage.due_replication_jobs()
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(await self.storage.pending_replication_count(), 1)
+        self.assertEqual((await self.storage.backend_usage())["minio"], 500)
+
+        await self.storage.complete_replication_job(jobs[0])
+
+        self.assertEqual(await self.storage.pending_replication_count(), 0)
+        self.assertEqual(
+            await self.storage.replicas_for("queued"),
+            [("minio", "files/queued")],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

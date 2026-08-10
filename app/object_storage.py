@@ -25,6 +25,8 @@ class S3Backend:
     secret_access_key: str
     priority: int = 100
     enabled: bool = True
+    capacity_bytes: int = 0
+    reserve_bytes: int = 0
     failures: int = 0
     unhealthy_until: float = 0
     latency_ms: float = 0
@@ -52,6 +54,8 @@ class ObjectStorageManager:
                 secret_access_key=str(item["secret_access_key"]),
                 priority=int(item.get("priority", 100)),
                 enabled=bool(item.get("enabled", True)),
+                capacity_bytes=max(0, int(item.get("capacity_bytes", 0))),
+                reserve_bytes=max(0, int(item.get("reserve_bytes", 0))),
             )
             for item in configs
         }
@@ -70,7 +74,8 @@ class ObjectStorageManager:
                 "name": item.name, "endpoint_url": item.endpoint_url, "bucket": item.bucket,
                 "region": item.region, "access_key_id": item.access_key_id,
                 "secret_access_key": item.secret_access_key, "priority": item.priority,
-                "enabled": item.enabled,
+                "enabled": item.enabled, "capacity_bytes": item.capacity_bytes,
+                "reserve_bytes": item.reserve_bytes,
             }
             for item in self.backends.values()
         ]
@@ -79,10 +84,28 @@ class ObjectStorageManager:
         replacement = ObjectStorageManager(tuple(configs), self.transfer_config.multipart_chunksize // (1024 * 1024), self.presign_seconds)
         self.backends = replacement.backends
 
-    def _candidates(self) -> list[S3Backend]:
+    def _candidates(
+        self,
+        incoming_size: int = 0,
+        usage: dict[str, int] | None = None,
+    ) -> list[S3Backend]:
         now = time.monotonic()
-        candidates = [b for b in self.backends.values() if b.enabled and b.unhealthy_until <= now]
-        return sorted(candidates, key=lambda b: (b.failures * 1000 + b.priority, b.latency_ms))
+        usage = usage or {}
+        candidates = []
+        for backend in self.backends.values():
+            if not backend.enabled or backend.unhealthy_until > now:
+                continue
+            used = usage.get(backend.name, 0)
+            if backend.capacity_bytes and used + incoming_size + backend.reserve_bytes > backend.capacity_bytes:
+                continue
+            candidates.append(backend)
+
+        def rank(backend: S3Backend) -> tuple[float, int, float]:
+            used = usage.get(backend.name, 0)
+            utilization = used / backend.capacity_bytes if backend.capacity_bytes else 0.0
+            return (utilization, backend.failures * 1000 + backend.priority, backend.latency_ms)
+
+        return sorted(candidates, key=rank)
 
     async def health_check(self, backend: S3Backend) -> bool:
         started = time.monotonic()
@@ -114,9 +137,14 @@ class ObjectStorageManager:
         object_key: str,
         content_type: str,
         progress: Callable[[int], None] | None = None,
+        usage: dict[str, int] | None = None,
     ) -> str:
         errors: list[str] = []
-        for backend in self._candidates():
+        incoming_size = source.stat().st_size
+        candidates = self._candidates(incoming_size, usage)
+        if not candidates:
+            raise RuntimeError("No healthy S3 backend has enough configured capacity")
+        for backend in candidates:
             transferred = 0
             lock = threading.Lock()
 
@@ -152,12 +180,27 @@ class ObjectStorageManager:
         content_type: str,
     ) -> None:
         backend = self.backends[backend_name]
+        if not backend.enabled:
+            raise RuntimeError(f"S3 backend is disabled for upload: {backend_name}")
         await asyncio.to_thread(
             backend.client().upload_file,
             str(source), backend.bucket, object_key,
             ExtraArgs={"ContentType": content_type},
             Config=self.transfer_config,
         )
+
+    def replication_targets(
+        self,
+        primary_backend: str,
+        desired_total: int,
+        incoming_size: int,
+        usage: dict[str, int] | None = None,
+    ) -> list[str]:
+        return [
+            item.name
+            for item in self._candidates(incoming_size, usage)
+            if item.name != primary_backend
+        ][: max(0, desired_total - 1)]
 
     async def replicate(
         self,
@@ -166,8 +209,14 @@ class ObjectStorageManager:
         content_type: str,
         primary_backend: str,
         desired_total: int,
+        usage: dict[str, int] | None = None,
     ) -> list[tuple[str, str]]:
-        candidates = [item for item in self._candidates() if item.name != primary_backend]
+        candidates = [
+            self.backends[name]
+            for name in self.replication_targets(
+                primary_backend, desired_total, source.stat().st_size, usage
+            )
+        ]
         replicas: list[tuple[str, str]] = []
         for backend in candidates[: max(0, desired_total - 1)]:
             try:
@@ -179,6 +228,19 @@ class ObjectStorageManager:
                 backend.unhealthy_until = time.monotonic() + min(300, 15 * 2 ** backend.failures)
                 logger.exception("Replication failed on backend %s", backend.name)
         return replicas
+
+    async def download_to(self, backend_name: str, object_key: str, destination: Path) -> None:
+        backend = self.backends.get(backend_name)
+        if backend is None:
+            raise RuntimeError(f"Unknown S3 backend: {backend_name}")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        await asyncio.to_thread(
+            backend.client().download_file,
+            backend.bucket,
+            object_key,
+            str(destination),
+            Config=self.transfer_config,
+        )
 
     def best_location(self, locations: list[tuple[str, str]]) -> tuple[str, str] | None:
         available = []

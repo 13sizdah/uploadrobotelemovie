@@ -3,9 +3,12 @@ from __future__ import annotations
 import asyncio
 import html
 import logging
+import os
+import shutil
 import secrets
 import time
 from dataclasses import dataclass
+from datetime import datetime
 
 from aiohttp import web
 
@@ -32,12 +35,19 @@ class AdminWeb:
         self.failed_logins: dict[str, list[float]] = {}
         self.migration_task: asyncio.Task[None] | None = None
         self.migration_status = "آماده برای انتقال فایل‌های محلی"
+        self.started_at = time.monotonic()
 
     def install(self, app: web.Application) -> None:
         app.router.add_get("/manage", self.redirect_to_index)
         app.router.add_get("/manage/", self.index)
+        app.router.add_get("/manage/files", self.files_page)
+        app.router.add_get("/manage/storage", self.storage_page)
+        app.router.add_get("/manage/jobs", self.jobs_page)
+        app.router.add_get("/manage/system", self.system_page)
         app.router.add_post("/manage/login", self.login)
         app.router.add_post("/manage/logout", self.logout)
+        app.router.add_post("/manage/files/delete", self.delete_file)
+        app.router.add_post("/manage/jobs/retry", self.retry_jobs)
         app.router.add_post("/manage/storage/add", self.add_storage)
         app.router.add_post("/manage/storage/mode", self.set_storage_mode)
         app.router.add_post("/manage/storage/replication", self.set_replication)
@@ -59,10 +69,19 @@ class AdminWeb:
         self.sessions.pop(token, None)
         return None
 
-    def page(self, body: str) -> web.Response:
-        markup = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>مدیریت ذخیره‌سازی</title><style>
-        *{{box-sizing:border-box}}body{{margin:0;background:#07152b;color:#f7faff;font:16px/1.7 Tahoma;padding:24px}}main{{max-width:760px;margin:auto}}.card{{background:#0d203a;border:1px solid #29405e;border-radius:20px;padding:24px;margin:16px 0}}h1,h2{{margin-top:0}}label{{display:block;margin-top:13px;color:#bdcbe0}}input,select{{width:100%;min-height:46px;border:1px solid #405775;border-radius:10px;background:#071426;color:white;padding:10px;direction:ltr}}button{{min-height:46px;border:0;border-radius:10px;background:#43d6c5;color:#06211e;font-weight:bold;padding:10px 18px;margin-top:18px;cursor:pointer}}button.danger{{background:#ff9d9d;color:#3d0909}}button:focus-visible,input:focus-visible{{outline:3px solid #8cf7ea;outline-offset:2px}}.row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.muted{{color:#aebed5}}.ok{{color:#70e7b8}}.bad{{color:#ff9d9d}}a{{color:#8cf7ea}}@media(max-width:600px){{.row{{grid-template-columns:1fr}}}}
-        </style></head><body><main><h1>پنل امن ذخیره‌سازی</h1>{body}</main></body></html>"""
+    def page(self, body: str, active: str = "", authenticated: bool = False) -> web.Response:
+        if not authenticated and "مسیر فایل‌های جدید" in body:
+            active, authenticated = "storage", True
+        links = (("dashboard", "/manage/", "داشبورد"), ("files", "/manage/files", "فایل‌ها"), ("storage", "/manage/storage", "فضاها"), ("jobs", "/manage/jobs", "صف انتقال"), ("system", "/manage/system", "سیستم"))
+        navigation = ""
+        if authenticated:
+            navigation = '<nav aria-label="منوی مدیریت">' + "".join(
+                f'<a class="{"active" if key == active else ""}" href="{url}">{label}</a>'
+                for key, url, label in links
+            ) + "</nav>"
+        markup = f"""<!doctype html><html lang="fa" dir="rtl"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>داشبورد ربات فایل</title><style>
+        :root{{--bg:#07111f;--panel:#0d1c2e;--line:#223a55;--text:#f5f8fc;--muted:#9fb0c7;--brand:#43d6c5;--danger:#ff9d9d}}*{{box-sizing:border-box}}body{{margin:0;background:radial-gradient(circle at 85% 0,#173a5b 0,transparent 34%),var(--bg);color:var(--text);font:15px/1.75 Tahoma,sans-serif}}.shell{{max-width:1180px;margin:auto;padding:24px}}header{{display:flex;align-items:center;justify-content:space-between;gap:16px;margin-bottom:18px}}header h1{{font-size:24px;margin:0}}nav{{display:flex;gap:7px;overflow:auto;padding:6px;background:#091726;border:1px solid var(--line);border-radius:14px;margin-bottom:22px}}nav a{{color:var(--muted);text-decoration:none;white-space:nowrap;padding:9px 15px;border-radius:9px}}nav a.active,nav a:hover{{background:#18344b;color:white}}.grid{{display:grid;grid-template-columns:repeat(4,1fr);gap:14px}}.two{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}.card{{background:linear-gradient(160deg,#10243a,#0b192a);border:1px solid var(--line);border-radius:17px;padding:20px;margin:0 0 14px;box-shadow:0 14px 45px #0003}}.metric b{{display:block;font-size:25px;color:white;direction:ltr;text-align:right}}.metric span,.muted{{color:var(--muted)}}h2,h3{{margin:0 0 12px}}label{{display:block;margin:12px 0 6px;color:#bdcbe0}}input,select{{width:100%;min-height:43px;border:1px solid #38516e;border-radius:9px;background:#071426;color:white;padding:9px;direction:ltr}}button{{min-height:42px;border:0;border-radius:9px;background:var(--brand);color:#06211e;font-weight:bold;padding:9px 16px;margin-top:14px;cursor:pointer}}button.danger{{background:var(--danger);color:#3d0909}}button.secondary{{background:#263f59;color:white}}button:focus-visible,input:focus-visible,a:focus-visible{{outline:3px solid #8cf7ea;outline-offset:2px}}.row{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}.ok{{color:#70e7b8}}.bad{{color:var(--danger)}}a{{color:#8cf7ea}}table{{width:100%;border-collapse:collapse;min-width:720px}}th,td{{text-align:right;padding:11px;border-bottom:1px solid var(--line)}}.table-wrap{{overflow:auto}}code{{direction:ltr;display:inline-block}}.badge{{padding:3px 9px;border-radius:99px;background:#19354c;color:#bfe9e4}}form.inline{{display:inline}}form.inline button{{margin:0;min-height:34px;padding:5px 10px}}@media(max-width:850px){{.grid{{grid-template-columns:1fr 1fr}}.two{{grid-template-columns:1fr}}}}@media(max-width:520px){{.shell{{padding:16px}}.grid{{grid-template-columns:1fr}}header{{align-items:flex-start;flex-direction:column}}.row{{grid-template-columns:1fr}}}}
+        </style></head><body><div class="shell"><header><div><h1>مدیریت ربات فایل</h1><div class="muted">کنترل فایل، ذخیره‌سازی و سلامت سرویس</div></div></header>{navigation}<main>{body}</main></div></body></html>"""
         response = web.Response(text=markup, content_type="text/html", charset="utf-8")
         response.headers.update({
             "Cache-Control": "no-store", "X-Frame-Options": "DENY",
@@ -71,7 +90,7 @@ class AdminWeb:
         })
         return response
 
-    async def index(self, request: web.Request) -> web.Response:
+    async def storage_page(self, request: web.Request) -> web.Response:
         session = self.session(request)
         if not session:
             return self.page('<section class="card"><h2>ورود مدیر</h2><form method="post" action="/manage/login"><label for="password">رمز عبور</label><input id="password" name="password" type="password" autocomplete="current-password" required><button>ورود امن</button></form></section>')
@@ -98,6 +117,91 @@ class AdminWeb:
         )
         migration_status = html.escape(self.migration_status)
         return self.page(f'''<section class="card"><h2>مسیر فایل‌های جدید</h2><p>حالت فعلی: <b>{html.escape(mode)}</b></p><form method="post" action="/manage/storage/mode"><input type="hidden" name="csrf" value="{session.csrf}"><select name="mode"><option value="s3">S3 هوشمند</option><option value="local">دیسک محلی</option></select><button>اعمال حالت</button></form><form method="post" action="/manage/storage/replication"><input type="hidden" name="csrf" value="{session.csrf}"><label>تعداد کل نسخه‌های هر فایل</label><input name="count" type="number" value="{html.escape(replication_count)}" min="1" max="5"><button>ذخیره تعداد نسخه‌ها</button></form></section>''' + cards + f'''<section class="card"><h2>انتقال فایل‌های قدیمی</h2><p class="muted">فایل‌های فعال روی دیسک، پس از آپلود موفق و ثبت در دیتابیس به S3 منتقل می‌شوند. نسخه محلی فقط در پایان هر انتقال پاک می‌شود.</p><p>{migration_status}</p><form method="post" action="/manage/storage/migrate"><input type="hidden" name="csrf" value="{session.csrf}"><button>شروع انتقال امن به S3</button></form></section><section class="card"><h2>افزودن فضای جدید</h2><form method="post" action="/manage/storage/add"><input type="hidden" name="csrf" value="{session.csrf}"><div class="row"><div><label>نام یکتا</label><input name="name" required></div><div><label>Region</label><input name="region" value="auto" required></div></div><label>Endpoint HTTPS</label><input name="endpoint_url" type="url" required><label>Bucket</label><input name="bucket" required><div class="row"><div><label>Access Key</label><input name="access_key_id" required></div><div><label>Secret Key</label><input name="secret_access_key" type="password" required></div></div><div class="row"><div><label>ظرفیت قابل استفاده (GB، صفر=نامحدود)</label><input name="capacity_gb" type="number" value="0" min="0" step="0.1"></div><div><label>فضای رزرو (GB)</label><input name="reserve_gb" type="number" value="0" min="0" step="0.1"></div></div><label>اولویت (عدد کمتر بهتر)</label><input name="priority" type="number" value="100" min="1" max="9999"><button>تست اتصال و ذخیره</button></form></section><form method="post" action="/manage/logout"><input type="hidden" name="csrf" value="{session.csrf}"><button>خروج</button></form>''')
+
+    async def index(self, request: web.Request) -> web.Response:
+        session = self.session(request)
+        if not session:
+            return self.page('<section class="card"><h2>ورود مدیر</h2><p class="muted">برای دسترسی به داشبورد وارد شوید.</p><form method="post" action="/manage/login"><label for="password">رمز عبور</label><input id="password" name="password" type="password" autocomplete="current-password" required><button>ورود امن</button></form></section>')
+        total, active_files, expired, active_bytes = await self.storage.statistics()
+        pending = await self.storage.pending_replication_count()
+        mode = await self.storage.get_setting("storage_backend", "local")
+        disk = shutil.disk_usage(self.storage.data_dir)
+        healthy = sum(
+            1 for item in self.manager.backends.values()
+            if item.enabled and item.unhealthy_until <= time.monotonic()
+        )
+        body = f'''<section class="grid"><div class="card metric"><span>فایل فعال</span><b>{active_files}</b></div><div class="card metric"><span>حجم فعال</span><b>{self._size(active_bytes)}</b></div><div class="card metric"><span>صف replication</span><b>{pending}</b></div><div class="card metric"><span>S3 سالم</span><b>{healthy}/{len(self.manager.backends)}</b></div></section><section class="two"><div class="card"><h2>وضعیت سرویس</h2><p><span class="badge">فعال</span> ربات و وب‌سرور در حال اجرا هستند.</p><p>حالت ذخیره‌سازی: <b>{html.escape(mode)}</b></p><p>فایل کل: {total} | منقضی‌شده در انتظار پاک‌سازی: {expired}</p><p>زمان کار این پردازش: {self._duration(time.monotonic() - self.started_at)}</p></div><div class="card"><h2>دیسک سرور</h2><p>مصرف: <b>{disk.used * 100 / disk.total:.1f}%</b></p><p>{self._size(disk.used)} از {self._size(disk.total)}</p><p>آزاد: <b>{self._size(disk.free)}</b></p><a href="/manage/system">جزئیات سیستم</a></div></section><section class="card"><h2>دسترسی سریع</h2><div class="row"><a href="/manage/files">مدیریت فایل‌ها</a><a href="/manage/storage">مدیریت فضاهای S3</a><a href="/manage/jobs">مشاهده صف انتقال</a></div><form method="post" action="/manage/logout"><input type="hidden" name="csrf" value="{session.csrf}"><button class="secondary">خروج امن</button></form></section>'''
+        return self.page(body, "dashboard", True)
+
+    async def files_page(self, request: web.Request) -> web.Response:
+        session = self.session(request)
+        if not session:
+            raise web.HTTPFound("/manage/")
+        rows = []
+        now = int(time.time())
+        for item in await self.storage.admin_files():
+            state = "فعال" if item.expires_at > now else "منقضی"
+            expires = datetime.fromtimestamp(item.expires_at).astimezone().strftime("%Y-%m-%d %H:%M")
+            rows.append(f'''<tr><td>{html.escape(item.original_name)}</td><td>{self._size(item.size)}</td><td><span class="badge">{html.escape(item.backend_name)}</span></td><td>{item.replica_count} / صف {item.pending_count}</td><td>{expires}<br><span class="muted">{state}</span></td><td><a href="/d/{item.token}" target="_blank">نمایش</a> <form class="inline" method="post" action="/manage/files/delete"><input type="hidden" name="csrf" value="{session.csrf}"><input type="hidden" name="token" value="{item.token}"><button class="danger">حذف</button></form></td></tr>''')
+        table = "".join(rows) or '<tr><td colspan="6" class="muted">فایلی ثبت نشده است.</td></tr>'
+        return self.page(f'''<section class="card"><h2>فایل‌ها</h2><p class="muted">۱۰۰ فایل اخیر؛ حذف شامل نسخه اصلی، replicaها، صف و فایل موقت است.</p><div class="table-wrap"><table><thead><tr><th>نام</th><th>حجم</th><th>محل اصلی</th><th>نسخه‌ها</th><th>انقضا</th><th>عملیات</th></tr></thead><tbody>{table}</tbody></table></div></section>''', "files", True)
+
+    async def jobs_page(self, request: web.Request) -> web.Response:
+        session = self.session(request)
+        if not session:
+            raise web.HTTPFound("/manage/")
+        rows = []
+        for job in await self.storage.admin_replication_jobs():
+            retry = datetime.fromtimestamp(job.next_attempt_at).astimezone().strftime("%Y-%m-%d %H:%M:%S") if job.next_attempt_at else "اکنون"
+            rows.append(f'''<tr><td>{job.id}</td><td>{html.escape(job.original_name)}</td><td>{html.escape(job.target_backend)}</td><td>{job.attempts}</td><td>{retry}</td><td>{html.escape(job.last_error or "—")}</td></tr>''')
+        table = "".join(rows) or '<tr><td colspan="6" class="muted">صف خالی است.</td></tr>'
+        return self.page(f'''<section class="card"><h2>صف انتقال پایدار</h2><p class="muted">کارهای ناموفق بعد از restart باقی می‌مانند و با فاصله افزایشی دوباره اجرا می‌شوند.</p><form method="post" action="/manage/jobs/retry"><input type="hidden" name="csrf" value="{session.csrf}"><button>اجرای دوباره همه کارها</button></form><div class="table-wrap"><table><thead><tr><th>ID</th><th>فایل</th><th>مقصد</th><th>تلاش</th><th>اجرای بعد</th><th>آخرین خطا</th></tr></thead><tbody>{table}</tbody></table></div></section>''', "jobs", True)
+
+    async def system_page(self, request: web.Request) -> web.Response:
+        session = self.session(request)
+        if not session:
+            raise web.HTTPFound("/manage/")
+        disk = shutil.disk_usage(self.storage.data_dir)
+        load = os.getloadavg() if hasattr(os, "getloadavg") else (0.0, 0.0, 0.0)
+        body = f'''<section class="grid"><div class="card metric"><span>دیسک آزاد</span><b>{self._size(disk.free)}</b></div><div class="card metric"><span>مصرف دیسک</span><b>{disk.used * 100 / disk.total:.1f}%</b></div><div class="card metric"><span>Load 1m</span><b>{load[0]:.2f}</b></div><div class="card metric"><span>Uptime پردازش</span><b>{self._duration(time.monotonic() - self.started_at)}</b></div></section><section class="card"><h2>وضعیت backendها</h2>{''.join(f'<p><b>{html.escape(item.name)}</b> — {"فعال" if item.enabled else "غیرفعال"} — latency {item.latency_ms:.0f}ms — خطا {item.failures}</p>' for item in self.manager.backends.values()) or '<p class="muted">S3 ثبت نشده است.</p>'}</section>'''
+        return self.page(body, "system", True)
+
+    async def delete_file(self, request: web.Request) -> web.Response:
+        _, data = await self.require_form_session(request)
+        item = await self.storage.get(data.get("token", ""))
+        if item:
+            try:
+                if item.backend_name != "local" and item.object_key:
+                    await self.manager.delete(item.backend_name, item.object_key)
+                for backend, key in await self.storage.replicas_for(item.token):
+                    await self.manager.delete(backend, key)
+                await self.storage.delete_stored_file(item.stored_name)
+                await self.storage.delete_record(item.token)
+            except Exception:
+                logger.exception("Admin could not delete file %s", item.token)
+                raise web.HTTPInternalServerError(text="File deletion failed")
+        raise web.HTTPFound("/manage/files")
+
+    async def retry_jobs(self, request: web.Request) -> web.Response:
+        await self.require_form_session(request)
+        await self.storage.retry_replication_jobs()
+        raise web.HTTPFound("/manage/jobs")
+
+    @staticmethod
+    def _size(size: int) -> str:
+        value = float(size)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if value < 1024 or unit == "TB":
+                return f"{value:.1f} {unit}"
+            value /= 1024
+        return f"{size} B"
+
+    @staticmethod
+    def _duration(seconds: float) -> str:
+        minutes = int(seconds // 60)
+        hours, minutes = divmod(minutes, 60)
+        days, hours = divmod(hours, 24)
+        return f"{days}d {hours}h {minutes}m"
 
     async def login(self, request: web.Request) -> web.Response:
         ip = request.remote or "unknown"

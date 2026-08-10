@@ -30,6 +30,28 @@ class ReplicationJob:
     attempts: int
 
 
+@dataclass(frozen=True)
+class AdminFile:
+    token: str
+    original_name: str
+    size: int
+    expires_at: int
+    backend_name: str
+    replica_count: int
+    pending_count: int
+
+
+@dataclass(frozen=True)
+class AdminReplicationJob:
+    id: int
+    token: str
+    original_name: str
+    target_backend: str
+    attempts: int
+    next_attempt_at: int
+    last_error: str
+
+
 class Storage:
     def __init__(self, data_dir: Path) -> None:
         self.data_dir = data_dir
@@ -338,6 +360,39 @@ class Storage:
                 )
             row = await cursor.fetchone()
         return int(row[0]) if row else 0
+
+    async def admin_files(self, limit: int = 100) -> list[AdminFile]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT f.token, f.original_name, f.size, f.expires_at,
+                          f.backend_name,
+                          (SELECT COUNT(*) FROM file_replicas r WHERE r.token = f.token),
+                          (SELECT COUNT(*) FROM replication_jobs j WHERE j.token = f.token)
+                   FROM files f ORDER BY f.expires_at DESC LIMIT ?""",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [AdminFile(*row) for row in rows]
+
+    async def admin_replication_jobs(self, limit: int = 100) -> list[AdminReplicationJob]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT j.id, j.token, f.original_name, j.target_backend,
+                          j.attempts, j.next_attempt_at, j.last_error
+                   FROM replication_jobs j JOIN files f ON f.token = j.token
+                   ORDER BY j.next_attempt_at, j.id LIMIT ?""",
+                (limit,),
+            )
+            rows = await cursor.fetchall()
+        return [AdminReplicationJob(*row) for row in rows]
+
+    async def retry_replication_jobs(self) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "UPDATE replication_jobs SET next_attempt_at = 0, last_error = ''"
+            )
+            await db.commit()
+        return max(0, cursor.rowcount)
 
     async def local_files(self, limit: int = 1000) -> list[StoredFile]:
         async with aiosqlite.connect(self.db_path) as db:

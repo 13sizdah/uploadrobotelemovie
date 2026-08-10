@@ -162,7 +162,34 @@ async def create_app(settings: Settings) -> None:
         status: Message,
         expected_size: int | None,
     ) -> int:
-        telegram_file = await bot.get_file(downloadable.file_id)
+        preparing_started = time.monotonic()
+
+        async def preparation_updates() -> None:
+            while True:
+                await asyncio.sleep(10)
+                elapsed = int(time.monotonic() - preparing_started)
+                minutes, seconds = divmod(elapsed, 60)
+                try:
+                    await status.edit_text(
+                        "مرحله ۱ از ۳ — تلگرام در حال آماده‌سازی فایل است\n\n"
+                        f"زمان سپری‌شده: {minutes:02d}:{seconds:02d}\n"
+                        "برای فایل‌های چندگیگابایتی این مرحله ممکن است چند دقیقه طول بکشد."
+                    )
+                except Exception as exc:
+                    logger.debug("Could not update preparation message: %s", exc)
+
+        preparation_task = asyncio.create_task(preparation_updates())
+        try:
+            # Local Bot API downloads the entire file before getFile returns. The
+            # aiogram default (60 seconds) is too short for multi-gigabyte media.
+            telegram_file = await bot.get_file(
+                downloadable.file_id,
+                request_timeout=6 * 60 * 60,
+            )
+        finally:
+            preparation_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await preparation_task
         if not telegram_file.file_path:
             raise RuntimeError("Telegram did not return a file path")
 

@@ -335,6 +335,30 @@ sudo systemctl enable --now docker
 
 فرمان `/backup` فایل‌های اصلی و `.env` را ارسال نمی‌کند. برای مهاجرت کامل از `scripts/backup.sh` استفاده کنید.
 
+### فعال‌کردن پنل وب مدیریت در نصب موجود
+
+```bash
+cd /opt/uploadrobotelemovie
+python3 scripts/hash_password.py
+sudo nano .env
+```
+
+خط `ADMIN_WEB_PASSWORD_HASH` تولیدشده را در `.env` قرار دهید، سپس:
+
+```bash
+docker compose up -d --build --force-recreate file-link-bot
+```
+
+پنل از مسیر زیر در دسترس است:
+
+```text
+https://download.example.com/manage/
+```
+
+در پنل می‌توان یک یا چند S3 را با Endpoint، Bucket، Region و کلیدها افزود. اتصال پیش از ذخیره آزمایش و تنظیمات در `data/s3-backends.enc` رمزگذاری می‌شوند؛ کلید رمزگشایی در `data/config.key` است.
+
+همچنین می‌توان تعداد نسخه‌های هر فایل را بین ۱ تا ۵ تنظیم کرد و فایل‌های فعال قدیمی را با دکمه «شروع انتقال امن به S3» منتقل کرد. تا وقتی پنل پایان عملیات را اعلام نکرده است کانتینر را متوقف یا بازسازی نکنید. در صورت شکست یک فایل، نسخه محلی آن حفظ می‌شود و می‌توان عملیات را دوباره اجرا کرد.
+
 ## ۱۰. تنظیم و بررسی Nginx
 
 بررسی صحت تنظیمات Nginx:

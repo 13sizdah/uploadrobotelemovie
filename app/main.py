@@ -32,7 +32,10 @@ from aiogram.types import (
 from aiogram.utils.markdown import hbold, hcode, hlink
 
 from .config import Settings
+from .admin_web import AdminWeb
 from .download_page import render_download_page, render_expired_page
+from .object_storage import ObjectStorageManager
+from .secure_config import EncryptedConfigStore
 from .storage import Storage, StoredFile
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
@@ -45,6 +48,14 @@ class IncomingFile:
     file_size: int | None
     file_name: str
     mime_type: str
+
+
+@dataclass(frozen=True)
+class PendingUpload:
+    requester_id: int
+    media: IncomingFile
+    max_bytes: int
+    created_at: float
 
 
 def incoming_file(message: Message) -> IncomingFile | None:
@@ -118,6 +129,18 @@ async def create_app(settings: Settings) -> None:
     storage = Storage(settings.data_dir)
     await storage.initialize()
     await storage.ensure_setting("forward_only", "1" if settings.forward_only else "0")
+    await storage.ensure_setting("storage_backend", settings.storage_backend)
+    await storage.ensure_setting("replication_count", "1")
+    encrypted_config = EncryptedConfigStore(settings.data_dir)
+    saved_s3_backends = await encrypted_config.load()
+    if saved_s3_backends is None and settings.s3_backends:
+        await encrypted_config.save(list(settings.s3_backends))
+    active_s3_backends = tuple(saved_s3_backends) if saved_s3_backends is not None else settings.s3_backends
+    object_storage = ObjectStorageManager(
+        active_s3_backends,
+        settings.s3_multipart_chunk_mb,
+        settings.s3_presigned_url_seconds,
+    )
 
     if settings.telegram_api_base:
         api_server = TelegramAPIServer.from_base(
@@ -137,7 +160,32 @@ async def create_app(settings: Settings) -> None:
     dispatcher = Dispatcher()
     router = Router()
     admins_adding_source: set[int] = set()
+    pending_uploads: dict[str, PendingUpload] = {}
     bot_started_at = time.monotonic()
+
+    async def delete_stored_item(item: StoredFile) -> bool:
+        try:
+            if item.backend_name == "local":
+                await storage.delete_stored_file(item.stored_name)
+            elif object_storage and item.object_key:
+                await object_storage.delete(item.backend_name, item.object_key)
+            else:
+                raise RuntimeError(f"Storage backend unavailable: {item.backend_name}")
+            if object_storage:
+                for backend_name, object_key in await storage.replicas_for(item.token):
+                    await object_storage.delete(backend_name, object_key)
+            await storage.delete_record(item.token)
+            return True
+        except Exception:
+            logger.exception("Could not delete stored item %s", item.token)
+            return False
+
+    async def cleanup_expired_items() -> int:
+        removed = 0
+        for item in await storage.expired_files():
+            if await delete_stored_item(item):
+                removed += 1
+        return removed
 
     def progress_text(received: int, total: int, started_at: float) -> str:
         elapsed = max(time.monotonic() - started_at, 0.001)
@@ -344,7 +392,7 @@ async def create_app(settings: Settings) -> None:
         if not is_admin(message.from_user.id if message.from_user else None):
             await message.answer("⛔️ دسترسی ندارید.")
             return
-        removed = await storage.cleanup_expired()
+        removed = await cleanup_expired_items()
         await message.answer(f"پاک‌سازی کامل شد؛ {removed} فایل منقضی حذف شد.")
 
     @router.message(Command("backup"))
@@ -405,7 +453,7 @@ async def create_app(settings: Settings) -> None:
         if not is_admin(callback.from_user.id):
             await callback.answer("دسترسی ندارید", show_alert=True)
             return
-        removed = await storage.cleanup_expired()
+        removed = await cleanup_expired_items()
         await callback.answer("پاک‌سازی انجام شد", show_alert=True)
         if callback.message:
             await callback.message.answer(f"پاک‌سازی کامل شد؛ {removed} فایل منقضی حذف شد.")
@@ -462,7 +510,8 @@ async def create_app(settings: Settings) -> None:
             await callback.answer("دسترسی ندارید", show_alert=True)
             return
         token = (callback.data or "").removeprefix("admin:file_yes:")
-        deleted = await storage.delete_by_token(token)
+        item = await storage.get(token)
+        deleted = bool(item and await delete_stored_item(item))
         await callback.answer("فایل حذف شد" if deleted else "فایل پیدا نشد", show_alert=True)
         if callback.message:
             await callback.message.edit_text("فایل و لینک آن حذف شدند." if deleted else "فایل قبلاً حذف شده بود.")
@@ -564,6 +613,171 @@ async def create_app(settings: Settings) -> None:
             f"زمان اعتبار لینک: {settings.file_ttl_hours} ساعت"
         )
 
+    async def perform_upload(
+        media: IncomingFile,
+        status: Message,
+        max_bytes: int,
+    ) -> None:
+        token = secrets.token_urlsafe(32)
+        stored_name = secrets.token_hex(16)
+        destination = storage.path_for(stored_name)
+        original_name = safe_filename(media.file_name)
+        uploaded_backend: str | None = None
+        object_key: str | None = None
+        uploaded_replicas: list[tuple[str, str]] = []
+        try:
+            actual_size = await download_with_progress(
+                media.downloadable,
+                destination,
+                status,
+                media.file_size,
+            )
+            await status.edit_text(
+                "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…"
+            )
+            if max_bytes and actual_size > max_bytes:
+                await storage.delete_stored_file(stored_name)
+                await status.edit_text("❌ حجم فایل از محدودیت مجاز بیشتر است.")
+                return
+            backend_name = "local"
+            if await storage.get_setting("storage_backend", settings.storage_backend) == "s3":
+                if object_storage is None:
+                    raise RuntimeError("S3 enabled without configured backends")
+                object_key = f"files/{int(time.time())}/{token}/{stored_name}"
+                cloud_uploaded = 0
+                cloud_started = time.monotonic()
+
+                def cloud_progress(value: int) -> None:
+                    nonlocal cloud_uploaded
+                    cloud_uploaded = value
+
+                async def cloud_progress_updates() -> None:
+                    while True:
+                        elapsed = max(time.monotonic() - cloud_started, 0.001)
+                        percent = min(cloud_uploaded * 100 / actual_size, 100) if actual_size else 0
+                        filled = min(int(percent / 10), 10)
+                        try:
+                            await status.edit_text(
+                                "مرحله ۳ از ۴ — انتقال به فضای ابری\n\n"
+                                f"{'▓' * filled}{'░' * (10 - filled)}  {percent:.1f}%\n"
+                                f"ارسال‌شده: {human_size(cloud_uploaded)} از {human_size(actual_size)}\n"
+                                f"سرعت: {human_size(int(cloud_uploaded / elapsed))}/s"
+                            )
+                        except Exception as exc:
+                            logger.debug("Could not update S3 progress: %s", exc)
+                        await asyncio.sleep(3)
+
+                cloud_task = asyncio.create_task(cloud_progress_updates())
+                try:
+                    backend_name = await object_storage.upload(
+                        destination, object_key, media.mime_type, cloud_progress
+                    )
+                    uploaded_backend = backend_name
+                finally:
+                    cloud_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await cloud_task
+                await status.edit_text(
+                    f"مرحله ۴ از ۴ — انتقال ابری کامل شد\nفضای انتخاب‌شده: {backend_name}"
+                )
+                replication_count = max(
+                    1, int(await storage.get_setting("replication_count", "1"))
+                )
+                if replication_count > 1:
+                    await status.edit_text(
+                        f"در حال ساخت {replication_count - 1} نسخه پشتیبان در فضاهای دیگر…"
+                    )
+                    uploaded_replicas = await object_storage.replicate(
+                        destination,
+                        object_key,
+                        media.mime_type,
+                        backend_name,
+                        replication_count,
+                    )
+                await storage.delete_stored_file(stored_name)
+            expires_at = int(time.time()) + settings.file_ttl_hours * 3600
+            await storage.add_with_replicas(
+                StoredFile(
+                    token=token,
+                    stored_name=stored_name,
+                    original_name=original_name,
+                    mime_type=media.mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
+                    size=actual_size,
+                    expires_at=expires_at,
+                    backend_name=backend_name,
+                    object_key=object_key,
+                ),
+                uploaded_replicas,
+            )
+        except Exception:
+            logger.exception("Could not save Telegram file")
+            await storage.delete_stored_file(stored_name)
+            if uploaded_backend and object_key:
+                with suppress(Exception):
+                    await object_storage.delete(uploaded_backend, object_key)
+            for replica_backend, replica_key in uploaded_replicas:
+                with suppress(Exception):
+                    await object_storage.delete(replica_backend, replica_key)
+            await status.edit_text("❌ دریافت فایل ناموفق بود. لطفاً دوباره تلاش کنید.")
+            return
+
+        link = f"{settings.public_base_url}/d/{token}"
+        expiry = datetime.fromtimestamp(expires_at).astimezone().strftime("%Y-%m-%d %H:%M")
+        await status.edit_text(
+            f"✅ فایل با موفقیت روی سرور ذخیره شد.\n\n"
+            f"🔗 {hlink('دانلود مستقیم فایل', link)}\n"
+            f"📋 لینک برای کپی:\n{hcode(link)}\n\n"
+            f"نام فایل: {hbold(original_name)}\n"
+            f"حجم: {human_size(actual_size)}\n"
+            f"انقضا: {expiry}",
+            parse_mode=ParseMode.HTML,
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [InlineKeyboardButton(text="⬇️ دانلود فایل", url=link)]
+                ]
+            ),
+            disable_web_page_preview=True,
+        )
+
+    @router.callback_query(F.data.startswith("upload:confirm:"))
+    async def confirm_upload(callback: CallbackQuery) -> None:
+        nonce = (callback.data or "").removeprefix("upload:confirm:")
+        pending = pending_uploads.get(nonce)
+        if pending is None or time.monotonic() - pending.created_at > 600:
+            pending_uploads.pop(nonce, None)
+            await callback.answer("این درخواست منقضی شده است", show_alert=True)
+            if callback.message:
+                await callback.message.edit_text("درخواست آپلود منقضی شد؛ فایل را دوباره ارسال کنید.")
+            return
+        if callback.from_user.id != pending.requester_id:
+            await callback.answer("فقط ارسال‌کننده فایل می‌تواند تصمیم بگیرد", show_alert=True)
+            return
+        pending_uploads.pop(nonce, None)
+        await callback.answer("آپلود آغاز شد")
+        if not callback.message:
+            return
+        await callback.message.edit_text("مرحله ۱ از ۳ — بررسی فایل و آماده‌سازی انتقال…")
+        await perform_upload(
+            pending.media,
+            callback.message,
+            pending.max_bytes,
+        )
+
+    @router.callback_query(F.data.startswith("upload:cancel:"))
+    async def cancel_upload(callback: CallbackQuery) -> None:
+        nonce = (callback.data or "").removeprefix("upload:cancel:")
+        pending = pending_uploads.get(nonce)
+        if pending is None:
+            await callback.answer("این درخواست دیگر فعال نیست", show_alert=True)
+            return
+        if callback.from_user.id != pending.requester_id:
+            await callback.answer("فقط ارسال‌کننده فایل می‌تواند تصمیم بگیرد", show_alert=True)
+            return
+        pending_uploads.pop(nonce, None)
+        await callback.answer("لغو شد")
+        if callback.message:
+            await callback.message.edit_text("آپلود فایل به درخواست شما لغو شد.")
+
     @router.message(
         F.document | F.video | F.audio | F.animation | F.voice | F.video_note | F.sticker | F.photo
     )
@@ -604,58 +818,31 @@ async def create_app(settings: Settings) -> None:
             await message.answer(f"❌ حجم فایل بیشتر از {settings.max_file_size_mb} مگابایت است.")
             return
 
-        status = await message.answer("مرحله ۱ از ۳ — بررسی فایل و مبدأ ارسال…")
-        token = secrets.token_urlsafe(32)
-        stored_name = secrets.token_hex(16)
-        destination = storage.path_for(stored_name)
         original_name = safe_filename(media.file_name)
-        try:
-            actual_size = await download_with_progress(
-                media.downloadable,
-                destination,
-                status,
-                media.file_size,
-            )
-            await status.edit_text(
-                "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…"
-            )
-            if max_bytes and actual_size > max_bytes:
-                await storage.delete_stored_file(stored_name)
-                await status.edit_text("❌ حجم فایل از محدودیت مجاز بیشتر است.")
-                return
-            expires_at = int(time.time()) + settings.file_ttl_hours * 3600
-            await storage.add(
-                StoredFile(
-                    token=token,
-                    stored_name=stored_name,
-                    original_name=original_name,
-                    mime_type=media.mime_type or mimetypes.guess_type(original_name)[0] or "application/octet-stream",
-                    size=actual_size,
-                    expires_at=expires_at,
-                )
-            )
-        except Exception:
-            logger.exception("Could not save Telegram file")
-            await storage.delete_stored_file(stored_name)
-            await status.edit_text("❌ دریافت فایل ناموفق بود. لطفاً دوباره تلاش کنید.")
+        if user_id is None:
+            await message.answer("❌ ارسال‌کننده پیام قابل شناسایی نیست.")
             return
-
-        link = f"{settings.public_base_url}/d/{token}"
-        expiry = datetime.fromtimestamp(expires_at).astimezone().strftime("%Y-%m-%d %H:%M")
-        await status.edit_text(
-            f"✅ فایل با موفقیت روی سرور ذخیره شد.\n\n"
-            f"🔗 {hlink('دانلود مستقیم فایل', link)}\n"
-            f"📋 لینک برای کپی:\n{hcode(link)}\n\n"
+        now = time.monotonic()
+        for old_nonce, pending in list(pending_uploads.items()):
+            if now - pending.created_at > 600:
+                pending_uploads.pop(old_nonce, None)
+        nonce = secrets.token_urlsafe(8)
+        pending_uploads[nonce] = PendingUpload(
+            requester_id=user_id,
+            media=media,
+            max_bytes=max_bytes,
+            created_at=now,
+        )
+        await message.answer(
+            "مرحله ۱ — تأیید آپلود\n\n"
             f"نام فایل: {hbold(original_name)}\n"
-            f"حجم: {human_size(actual_size)}\n"
-            f"انقضا: {expiry}",
+            f"حجم: {human_size(media.file_size) if media.file_size else 'نامشخص'}\n\n"
+            "آیا فایل روی سرور آپلود و لینک دانلود ساخته شود؟",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [InlineKeyboardButton(text="⬇️ دانلود فایل", url=link)]
-                ]
-            ),
-            disable_web_page_preview=True,
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="آپلود روی سرور", callback_data=f"upload:confirm:{nonce}"),
+                InlineKeyboardButton(text="لغو فرایند", callback_data=f"upload:cancel:{nonce}"),
+            ]]),
         )
 
     @router.message()
@@ -685,10 +872,12 @@ async def create_app(settings: Settings) -> None:
         secure_page_headers(response)
         return response
 
-    async def get_download_item(request: web.Request) -> tuple[StoredFile, Path] | None:
+    async def get_download_item(request: web.Request) -> tuple[StoredFile, Path | None] | None:
         item = await storage.get_valid(request.match_info["token"])
         if item is None:
             return None
+        if item.backend_name != "local":
+            return item, None
         path = storage.path_for(item.stored_name)
         if not path.is_file():
             return None
@@ -718,6 +907,20 @@ async def create_app(settings: Settings) -> None:
         if result is None:
             raise web.HTTPFound(location=f"/d/{request.match_info['token']}")
         item, path = result
+        if item.backend_name != "local":
+            if object_storage is None or not item.object_key:
+                return expired_response()
+            locations = [(item.backend_name, item.object_key)]
+            locations.extend(await storage.replicas_for(item.token))
+            selected = await object_storage.resolve_download_location(locations)
+            if selected is None:
+                return expired_response()
+            backend_name, object_key = selected
+            url = await object_storage.presigned_download(
+                backend_name, object_key, item.original_name
+            )
+            raise web.HTTPFound(location=url)
+        assert path is not None
         response = web.FileResponse(path)
         response.content_type = item.mime_type
         response.headers["Content-Disposition"] = attachment_header(item.original_name)
@@ -731,6 +934,13 @@ async def create_app(settings: Settings) -> None:
     web_app.router.add_get("/d/{token}", download_page)
     web_app.router.add_get("/download/{token}", download_file)
     web_app.router.add_get("/health", health)
+    if settings.admin_web_password_hash:
+        AdminWeb(
+            settings.admin_web_password_hash,
+            object_storage,
+            encrypted_config,
+            storage,
+        ).install(web_app)
     runner = web.AppRunner(web_app)
     await runner.setup()
     site = web.TCPSite(runner, settings.host, settings.port)
@@ -740,20 +950,33 @@ async def create_app(settings: Settings) -> None:
     async def cleanup_loop() -> None:
         while True:
             try:
-                removed = await storage.cleanup_expired()
+                removed = await cleanup_expired_items()
                 if removed:
                     logger.info("Removed %d expired files", removed)
             except Exception:
                 logger.exception("Cleanup failed")
             await asyncio.sleep(settings.cleanup_interval_seconds)
 
+    async def storage_health_loop() -> None:
+        while True:
+            try:
+                if object_storage.backends:
+                    await object_storage.health_check_all()
+            except Exception:
+                logger.exception("S3 health check cycle failed")
+            await asyncio.sleep(60)
+
     cleanup_task = asyncio.create_task(cleanup_loop())
+    health_task = asyncio.create_task(storage_health_loop())
     try:
         await dispatcher.start_polling(bot, allowed_updates=dispatcher.resolve_used_update_types())
     finally:
         cleanup_task.cancel()
+        health_task.cancel()
         with suppress(asyncio.CancelledError):
             await cleanup_task
+        with suppress(asyncio.CancelledError):
+            await health_task
         await runner.cleanup()
         await bot.session.close()
 

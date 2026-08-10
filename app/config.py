@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +37,11 @@ class Settings:
     forward_only: bool
     telegram_api_base: str | None
     telegram_file_base: str | None
+    storage_backend: str
+    s3_backends: tuple[dict[str, object], ...]
+    s3_presigned_url_seconds: int
+    s3_multipart_chunk_mb: int
+    admin_web_password_hash: str | None
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -53,6 +59,20 @@ class Settings:
         forward_only = os.getenv("FORWARD_ONLY", "false").strip().lower() in {"1", "true", "yes", "on"}
         if forward_only and not admin_user_id:
             raise ValueError("ADMIN_USER_ID is required when FORWARD_ONLY is enabled")
+        storage_backend = os.getenv("STORAGE_BACKEND", "local").strip().lower()
+        if storage_backend not in {"local", "s3"}:
+            raise ValueError("STORAGE_BACKEND must be local or s3")
+        raw_s3 = os.getenv("S3_BACKENDS_JSON", "[]").strip() or "[]"
+        try:
+            s3_backends = json.loads(raw_s3)
+        except json.JSONDecodeError as exc:
+            raise ValueError("S3_BACKENDS_JSON is not valid JSON") from exc
+        if not isinstance(s3_backends, list):
+            raise ValueError("S3_BACKENDS_JSON must be a JSON array")
+        required = {"name", "endpoint_url", "bucket", "access_key_id", "secret_access_key"}
+        for backend in s3_backends:
+            if not isinstance(backend, dict) or not required.issubset(backend):
+                raise ValueError("Every S3 backend must include name, endpoint_url, bucket and credentials")
         return cls(
             bot_token=token,
             public_base_url=base_url,
@@ -67,4 +87,9 @@ class Settings:
             forward_only=forward_only,
             telegram_api_base=os.getenv("TELEGRAM_API_BASE") or None,
             telegram_file_base=os.getenv("TELEGRAM_FILE_BASE") or None,
+            storage_backend=storage_backend,
+            s3_backends=tuple(s3_backends),
+            s3_presigned_url_seconds=_positive_int("S3_PRESIGNED_URL_SECONDS", 300),
+            s3_multipart_chunk_mb=_positive_int("S3_MULTIPART_CHUNK_MB", 64),
+            admin_web_password_hash=os.getenv("ADMIN_WEB_PASSWORD_HASH") or None,
         )

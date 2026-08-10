@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import html
+import base64
+import hashlib
 import json
 import os
 import re
@@ -55,6 +57,17 @@ def env_quote(value: str) -> str:
     return '"' + value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "") + '"'
 
 
+def password_hash(value: str) -> str:
+    salt = os.urandom(16)
+    iterations = 600_000
+    digest = hashlib.pbkdf2_hmac("sha256", value.encode(), salt, iterations)
+    return "pbkdf2_sha256${}${}${}".format(
+        iterations,
+        base64.urlsafe_b64encode(salt).decode(),
+        base64.urlsafe_b64encode(digest).decode(),
+    )
+
+
 def install(config: dict[str, str]) -> None:
     global INSTALLING
     try:
@@ -71,11 +84,31 @@ def install(config: dict[str, str]) -> None:
             "CLEANUP_INTERVAL_SECONDS=300",
             f"ALLOWED_USER_IDS={env_quote(config['allowed_ids'])}",
             f"ADMIN_USER_ID={config['admin_id']}",
+            f"ADMIN_WEB_PASSWORD_HASH={env_quote(password_hash(config['web_password']))}",
             f"FORWARD_ONLY={config['forward_only']}",
             f"TELEGRAM_API_ID={config['api_id']}",
             f"TELEGRAM_API_HASH={env_quote(config['api_hash'])}",
             "TELEGRAM_API_BASE=http://telegram-bot-api:8081",
         ]
+        if config["storage_backend"] == "s3":
+            s3_config = [{
+                "name": config["s3_name"],
+                "endpoint_url": config["s3_endpoint"],
+                "bucket": config["s3_bucket"],
+                "region": config["s3_region"] or "auto",
+                "access_key_id": config["s3_access_key"],
+                "secret_access_key": config["s3_secret_key"],
+                "priority": 100,
+                "enabled": True,
+            }]
+            env_lines.extend([
+                "STORAGE_BACKEND=s3",
+                f"S3_BACKENDS_JSON={env_quote(json.dumps(s3_config, separators=(',', ':')))}",
+                "S3_MULTIPART_CHUNK_MB=64",
+                "S3_PRESIGNED_URL_SECONDS=300",
+            ])
+        else:
+            env_lines.extend(["STORAGE_BACKEND=local", "S3_BACKENDS_JSON=[]"])
         env_path = PROJECT_DIR / ".env"
         env_path.write_text("\n".join(env_lines) + "\n", encoding="utf-8")
         env_path.chmod(0o600)
@@ -188,10 +221,11 @@ class Handler(BaseHTTPRequestHandler):
 const key={json.dumps(SETUP_TOKEN)}; const root=document.getElementById('wizard');
 function dots(n){{document.querySelectorAll('.dot').forEach((x,i)=>x.classList.toggle('on',i<n))}}
 function wizard(n){{dots(n); if(n===2) root.innerHTML=`<h2>مرحله ۲: اطلاعات تلگرام</h2><label>توکن ربات از BotFather</label><input id="bot_token" placeholder="123456:ABC..."><div class="row"><div><label>API ID از my.telegram.org</label><input id="api_id" inputmode="numeric"></div><div><label>API Hash</label><input id="api_hash"></div></div><div class="actions"><button class="btn" onclick="wizard(3)">ادامه</button></div>`;
-if(n===3) root.innerHTML=`<h2>مرحله ۳: دامنه و دسترسی</h2><label>دامنه متصل‌شده به IP سرور</label><input id="domain" placeholder="download.example.com"><div class="row"><div><label>مدت نگهداری فایل (ساعت)</label><input id="ttl" type="number" min="1" value="24"></div><div><label>شناسه عددی مدیر ربات</label><input id="admin_id" inputmode="numeric" placeholder="123456789"></div></div><label>پذیرش فقط فایل فورواردشده از منابع پنل</label><select id="forward_only"><option value="true">فعال</option><option value="false">غیرفعال</option></select><label>شناسه کاربران مجاز (اختیاری)</label><input id="allowed_ids" placeholder="12345,67890"><label>فعال‌سازی خودکار HTTPS</label><select id="ssl"><option value="yes">بله، گواهی رایگان بگیر</option><option value="no">خیر، بعداً انجام می‌دهم</option></select><label>ایمیل برای گواهی SSL</label><input id="email" type="email" placeholder="admin@example.com"><div class="actions"><button class="btn" onclick="wizard(4)">بررسی نهایی</button></div>`;
-if(n===4) root.innerHTML=`<h2>مرحله ۴: تأیید</h2><p class="muted">Docker، ربات، Local Bot API و Nginx راه‌اندازی خواهند شد. دامنه باید هم‌اکنون به IP این سرور اشاره کند.</p><div id="err"></div><div class="actions"><button class="btn" onclick="startInstall()">شروع نصب</button></div>`;}}
+if(n===3) root.innerHTML=`<h2>مرحله ۳: دامنه و دسترسی</h2><label>دامنه متصل‌شده به IP سرور</label><input id="domain" placeholder="download.example.com"><div class="row"><div><label>مدت نگهداری فایل (ساعت)</label><input id="ttl" type="number" min="1" value="24"></div><div><label>شناسه عددی مدیر ربات</label><input id="admin_id" inputmode="numeric" placeholder="123456789"></div></div><label>رمز قوی پنل وب مدیریت</label><input id="web_password" type="password" minlength="12" required><label>پذیرش فقط فایل فورواردشده از منابع پنل</label><select id="forward_only"><option value="true">فعال</option><option value="false">غیرفعال</option></select><label>شناسه کاربران مجاز (اختیاری)</label><input id="allowed_ids" placeholder="12345,67890"><label>فعال‌سازی خودکار HTTPS</label><select id="ssl"><option value="yes">بله، گواهی رایگان بگیر</option><option value="no">خیر، بعداً انجام می‌دهم</option></select><label>ایمیل برای گواهی SSL</label><input id="email" type="email" placeholder="admin@example.com"><div class="actions"><button class="btn" onclick="wizard(4)">تنظیم فضای ذخیره‌سازی</button></div>`;
+if(n===4) root.innerHTML=`<h2>مرحله ۴: فضای ذخیره‌سازی</h2><label>نوع ذخیره‌سازی</label><select id="storage_backend"><option value="s3">فضای S3 (پیشنهادی)</option><option value="local">دیسک محلی</option></select><div class="row"><div><label>نام فضا</label><input id="s3_name" value="primary-r2"></div><div><label>Region</label><input id="s3_region" value="auto"></div></div><label>S3 Endpoint</label><input id="s3_endpoint" placeholder="https://ACCOUNT_ID.r2.cloudflarestorage.com"><label>Bucket</label><input id="s3_bucket"><div class="row"><div><label>Access Key</label><input id="s3_access_key"></div><div><label>Secret Key</label><input id="s3_secret_key" type="password"></div></div><p class="muted">کلیدها فقط در فایل .env با دسترسی 600 ذخیره می‌شوند.</p><div class="actions"><button class="btn" onclick="wizard(5)">بررسی نهایی</button></div>`;
+if(n===5) root.innerHTML=`<h2>مرحله ۵: تأیید</h2><p class="muted">Docker، ربات، Local Bot API، فضای ذخیره‌سازی و Nginx راه‌اندازی خواهند شد.</p><div id="err"></div><div class="actions"><button class="btn" onclick="startInstall()">شروع نصب</button></div>`;}}
 let values={{}}; document.addEventListener('input',e=>{{if(e.target.id)values[e.target.id]=e.target.value}}); document.addEventListener('change',e=>{{if(e.target.id)values[e.target.id]=e.target.value}});
-async function startInstall(){{values.ssl=values.ssl||'yes';values.ttl=values.ttl||'24';values.forward_only=values.forward_only||'true'; let r=await fetch('/install?key='+encodeURIComponent(key),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(values)}});let j=await r.json();if(!r.ok){{document.getElementById('err').innerHTML='<div class="error">'+j.error+'</div>';return}};dots(5);root.innerHTML='<h2>مرحله ۵: در حال نصب</h2><pre id="log">شروع…</pre>';poll()}}
+async function startInstall(){{values.ssl=values.ssl||'yes';values.ttl=values.ttl||'24';values.forward_only=values.forward_only||'true';values.storage_backend=values.storage_backend||'s3';values.s3_name=values.s3_name||'primary-r2';values.s3_region=values.s3_region||'auto'; let r=await fetch('/install?key='+encodeURIComponent(key),{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(values)}});let j=await r.json();if(!r.ok){{document.getElementById('err').innerHTML='<div class="error">'+j.error+'</div>';return}};dots(5);root.innerHTML='<h2>در حال نصب</h2><pre id="log">شروع…</pre>';poll()}}
 async function poll(){{let r=await fetch('/status?key='+encodeURIComponent(key));let j=await r.json();document.getElementById('log').textContent=j.log;document.getElementById('log').scrollTop=999999;if(!j.done&&j.running)setTimeout(poll,1500);else if(j.done)root.insertAdjacentHTML('beforeend','<h3 class="ok">نصب با موفقیت تمام شد ✓</h3>')}}
 </script>"""
 
@@ -218,7 +252,13 @@ async function poll(){{let r=await fetch('/status?key='+encodeURIComponent(key))
             allowed = str(config.get("allowed_ids", ""))
             if allowed and not re.fullmatch(r"\d+(?:,\d+)*", allowed): errors.append("شناسه‌های کاربران معتبر نیست")
             if not str(config.get("admin_id", "")).isdigit() or int(config.get("admin_id", 0)) <= 0: errors.append("شناسه مدیر معتبر نیست")
+            if len(str(config.get("web_password", ""))) < 12: errors.append("رمز پنل وب باید حداقل ۱۲ کاراکتر باشد")
             if config.get("forward_only") not in {"true", "false"}: errors.append("حالت محدودسازی معتبر نیست")
+            if config.get("storage_backend") not in {"local", "s3"}: errors.append("نوع ذخیره‌سازی معتبر نیست")
+            if config.get("storage_backend") == "s3":
+                for field in ("s3_name", "s3_endpoint", "s3_bucket", "s3_access_key", "s3_secret_key"):
+                    if not str(config.get(field, "")).strip(): errors.append(f"فیلد {field} الزامی است")
+                if not str(config.get("s3_endpoint", "")).startswith("https://"): errors.append("Endpoint باید HTTPS باشد")
             if config.get("ssl") == "yes" and not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", str(config.get("email", ""))): errors.append("ایمیل SSL معتبر نیست")
             if os.geteuid() != 0: errors.append("نصب‌کننده باید با sudo اجرا شود")
             for executable in ("docker", "nginx", "systemctl"):
@@ -227,7 +267,7 @@ async function poll(){{let r=await fetch('/status?key='+encodeURIComponent(key))
             if errors:
                 self.send_json({"error": "، ".join(errors)}, 400)
                 return
-            config = {k: str(config.get(k, "")).strip() for k in ("bot_token", "api_id", "api_hash", "domain", "ttl", "allowed_ids", "admin_id", "forward_only", "ssl", "email")}
+            config = {k: str(config.get(k, "")).strip() for k in ("bot_token", "api_id", "api_hash", "domain", "ttl", "allowed_ids", "admin_id", "web_password", "forward_only", "ssl", "email", "storage_backend", "s3_name", "s3_endpoint", "s3_bucket", "s3_region", "s3_access_key", "s3_secret_key")}
             with LOCK:
                 if INSTALLING:
                     self.send_json({"error": "نصب در حال اجراست"}, 409)

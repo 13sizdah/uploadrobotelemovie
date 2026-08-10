@@ -17,6 +17,8 @@ class StoredFile:
     mime_type: str
     size: int
     expires_at: int
+    backend_name: str = "local"
+    object_key: str | None = None
 
 
 class Storage:
@@ -40,6 +42,11 @@ class Storage:
                 )"""
             )
             await db.execute("CREATE INDEX IF NOT EXISTS idx_files_expires ON files(expires_at)")
+            columns = {row[1] for row in await (await db.execute("PRAGMA table_info(files)")).fetchall()}
+            if "backend_name" not in columns:
+                await db.execute("ALTER TABLE files ADD COLUMN backend_name TEXT NOT NULL DEFAULT 'local'")
+            if "object_key" not in columns:
+                await db.execute("ALTER TABLE files ADD COLUMN object_key TEXT")
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS allowed_sources (
                     source_id INTEGER PRIMARY KEY,
@@ -52,6 +59,16 @@ class Storage:
                 """CREATE TABLE IF NOT EXISTS bot_settings (
                     key TEXT PRIMARY KEY,
                     value TEXT NOT NULL
+                )"""
+            )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS file_replicas (
+                    token TEXT NOT NULL,
+                    backend_name TEXT NOT NULL,
+                    object_key TEXT NOT NULL,
+                    created_at INTEGER NOT NULL,
+                    PRIMARY KEY(token, backend_name),
+                    FOREIGN KEY(token) REFERENCES files(token) ON DELETE CASCADE
                 )"""
             )
             await db.commit()
@@ -142,6 +159,97 @@ class Storage:
         await self.delete_stored_file(row[0])
         return True
 
+    async def get(self, token: str) -> StoredFile | None:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM files WHERE token = ?", (token,))
+            row = await cursor.fetchone()
+        return StoredFile(**dict(row)) if row else None
+
+    async def expired_files(self) -> list[StoredFile]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute("SELECT * FROM files WHERE expires_at <= ?", (int(time.time()),))
+            rows = await cursor.fetchall()
+        return [StoredFile(**dict(row)) for row in rows]
+
+    async def delete_record(self, token: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM file_replicas WHERE token = ?", (token,))
+            await db.execute("DELETE FROM files WHERE token = ?", (token,))
+            await db.commit()
+
+    async def add_replicas(self, token: str, replicas: list[tuple[str, str]]) -> None:
+        if not replicas:
+            return
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.executemany(
+                "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
+                [(token, backend, key, int(time.time())) for backend, key in replicas],
+            )
+            await db.commit()
+
+    async def replicas_for(self, token: str) -> list[tuple[str, str]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT backend_name, object_key FROM file_replicas WHERE token = ?",
+                (token,),
+            )
+        return await cursor.fetchall()
+
+    async def backend_reference_count(self, backend_name: str) -> int:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """SELECT
+                    (SELECT COUNT(*) FROM files WHERE backend_name = ?) +
+                    (SELECT COUNT(*) FROM file_replicas WHERE backend_name = ?)""",
+                (backend_name, backend_name),
+            )
+            row = await cursor.fetchone()
+        return int(row[0]) if row else 0
+
+    async def local_files(self, limit: int = 1000) -> list[StoredFile]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            cursor = await db.execute(
+                "SELECT * FROM files WHERE backend_name = 'local' AND expires_at > ? LIMIT ?",
+                (int(time.time()), limit),
+            )
+            rows = await cursor.fetchall()
+        return [StoredFile(**dict(row)) for row in rows]
+
+    async def mark_migrated(self, token: str, backend_name: str, object_key: str) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE files SET backend_name = ?, object_key = ? WHERE token = ?",
+                (backend_name, object_key, token),
+            )
+            await db.commit()
+
+    async def mark_migrated_with_replicas(
+        self,
+        token: str,
+        backend_name: str,
+        object_key: str,
+        replicas: list[tuple[str, str]],
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN")
+            cursor = await db.execute(
+                "UPDATE files SET backend_name = ?, object_key = ? "
+                "WHERE token = ? AND backend_name = 'local'",
+                (backend_name, object_key, token),
+            )
+            if cursor.rowcount != 1:
+                await db.rollback()
+                raise RuntimeError("File is no longer eligible for migration")
+            if replicas:
+                await db.executemany(
+                    "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
+                    [(token, backend, key, int(time.time())) for backend, key in replicas],
+                )
+            await db.commit()
+
     async def create_database_backup(self, destination: Path) -> None:
         destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -154,9 +262,34 @@ class Storage:
     async def add(self, item: StoredFile) -> None:
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute(
-                "INSERT INTO files VALUES (?, ?, ?, ?, ?, ?)",
-                (item.token, item.stored_name, item.original_name, item.mime_type, item.size, item.expires_at),
+                """INSERT INTO files
+                (token, stored_name, original_name, mime_type, size, expires_at, backend_name, object_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item.token, item.stored_name, item.original_name, item.mime_type,
+                    item.size, item.expires_at, item.backend_name, item.object_key,
+                ),
             )
+            await db.commit()
+
+    async def add_with_replicas(
+        self, item: StoredFile, replicas: list[tuple[str, str]]
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO files
+                (token, stored_name, original_name, mime_type, size, expires_at, backend_name, object_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    item.token, item.stored_name, item.original_name, item.mime_type,
+                    item.size, item.expires_at, item.backend_name, item.object_key,
+                ),
+            )
+            if replicas:
+                await db.executemany(
+                    "INSERT INTO file_replicas VALUES (?, ?, ?, ?)",
+                    [(item.token, backend, key, int(time.time())) for backend, key in replicas],
+                )
             await db.commit()
 
     async def get_valid(self, token: str) -> StoredFile | None:

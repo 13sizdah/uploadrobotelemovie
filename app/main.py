@@ -228,6 +228,7 @@ async def create_app(settings: Settings) -> None:
         expected_size: int | None,
         cancelled: threading.Event,
         zero_copy_s3: bool = False,
+        progress_markup: InlineKeyboardMarkup | None = None,
     ) -> tuple[int, Path | None]:
         preparing_started = time.monotonic()
 
@@ -240,7 +241,8 @@ async def create_app(settings: Settings) -> None:
                     await status.edit_text(
                         "مرحله ۱ از ۳ — تلگرام در حال آماده‌سازی فایل است\n\n"
                         f"زمان سپری‌شده: {minutes:02d}:{seconds:02d}\n"
-                        "برای فایل‌های چندگیگابایتی این مرحله ممکن است چند دقیقه طول بکشد."
+                        "برای فایل‌های چندگیگابایتی این مرحله ممکن است چند دقیقه طول بکشد.",
+                        reply_markup=progress_markup,
                     )
                 except Exception as exc:
                     logger.debug("Could not update preparation message: %s", exc)
@@ -249,10 +251,17 @@ async def create_app(settings: Settings) -> None:
         try:
             # Local Bot API downloads the entire file before getFile returns. The
             # aiogram default (60 seconds) is too short for multi-gigabyte media.
-            telegram_file = await bot.get_file(
-                downloadable.file_id,
-                request_timeout=6 * 60 * 60,
+            get_file_task = asyncio.create_task(
+                bot.get_file(downloadable.file_id, request_timeout=6 * 60 * 60)
             )
+            while not get_file_task.done():
+                if cancelled.is_set():
+                    get_file_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await get_file_task
+                    raise UploadCancelled("Upload cancelled by user")
+                await asyncio.sleep(1)
+            telegram_file = await get_file_task
         finally:
             preparation_task.cancel()
             with suppress(asyncio.CancelledError):
@@ -292,7 +301,10 @@ async def create_app(settings: Settings) -> None:
             if not force and (now - last_update < 3 or current_percent == last_percent):
                 return
             try:
-                await status.edit_text(progress_text(received, total, started_at))
+                await status.edit_text(
+                    progress_text(received, total, started_at),
+                    reply_markup=progress_markup,
+                )
                 last_update = now
                 last_percent = current_percent
             except Exception as exc:
@@ -659,6 +671,7 @@ async def create_app(settings: Settings) -> None:
         max_bytes: int,
         cancelled: threading.Event,
         preferred_backend: str | None = None,
+        progress_markup: InlineKeyboardMarkup | None = None,
     ) -> None:
         token = secrets.token_urlsafe(32)
         stored_name = secrets.token_hex(16)
@@ -680,15 +693,18 @@ async def create_app(settings: Settings) -> None:
                 media.file_size,
                 cancelled,
                 zero_copy_s3=storage_mode == "s3",
+                progress_markup=progress_markup,
             )
             if telegram_cache_source is not None:
                 await status.edit_text(
                     "مرحله ۱ از ۳ — فایل در cache تلگرام آماده شد\n"
-                    "مرحله ۲ — شروع انتقال مستقیم به فضای ابری…"
+                    "مرحله ۲ — شروع انتقال مستقیم به فضای ابری…",
+                    reply_markup=progress_markup,
                 )
             else:
                 await status.edit_text(
-                    "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…"
+                    "مرحله ۳ از ۳ — انتقال ۱۰۰٪ کامل شد\nدر حال ثبت فایل و ساخت لینک دانلود…",
+                    reply_markup=progress_markup,
                 )
             if max_bytes and actual_size > max_bytes:
                 await storage.delete_stored_file(stored_name)
@@ -718,7 +734,8 @@ async def create_app(settings: Settings) -> None:
                                  "مرحله ۳ از ۴ — انتقال به فضای ابری\n\n") +
                                 f"{'▓' * filled}{'░' * (10 - filled)}  {percent:.1f}%\n"
                                 f"ارسال‌شده: {human_size(cloud_uploaded)} از {human_size(actual_size)}\n"
-                                f"سرعت: {human_size(int(cloud_uploaded / elapsed))}/s"
+                                f"سرعت: {human_size(int(cloud_uploaded / elapsed))}/s",
+                                reply_markup=progress_markup,
                             )
                         except Exception as exc:
                             logger.debug("Could not update S3 progress: %s", exc)
@@ -755,7 +772,8 @@ async def create_app(settings: Settings) -> None:
                 await status.edit_text(
                     (f"مرحله ۳ از ۳ — انتقال مستقیم کامل شد\nفضای انتخاب‌شده: {backend_name}"
                      if telegram_cache_source is not None else
-                     f"مرحله ۴ از ۴ — انتقال ابری کامل شد\nفضای انتخاب‌شده: {backend_name}")
+                     f"مرحله ۴ از ۴ — انتقال ابری کامل شد\nفضای انتخاب‌شده: {backend_name}"),
+                    reply_markup=progress_markup,
                 )
                 # A user-selected destination is authoritative. Automatic mode
                 # retains the administrator's configured replication policy.
@@ -767,11 +785,13 @@ async def create_app(settings: Settings) -> None:
                 if promotion_target:
                     replication_targets = [(promotion_target, object_key)]
                     await status.edit_text(
-                        "نسخه موقت خارج آماده شد؛ انتقال سریع توسط Worker ایران در صف قرار گرفت…"
+                        "نسخه موقت خارج آماده شد؛ انتقال سریع توسط Worker ایران در صف قرار گرفت…",
+                        reply_markup=progress_markup,
                     )
                 elif replication_count > 1:
                     await status.edit_text(
-                        "نسخه اصلی ثبت شد؛ replicaها در صف پایدار قرار می‌گیرند…"
+                        "نسخه اصلی ثبت شد؛ replicaها در صف پایدار قرار می‌گیرند…",
+                        reply_markup=progress_markup,
                     )
                     replication_targets = [
                         (target, object_key)
@@ -879,7 +899,7 @@ async def create_app(settings: Settings) -> None:
         try:
             await perform_upload(
                 pending.media, callback.message, pending.max_bytes, cancelled,
-                preferred_backend,
+                preferred_backend, abort_keyboard,
             )
         finally:
             active_uploads.pop(nonce, None)

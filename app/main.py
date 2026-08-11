@@ -658,6 +658,7 @@ async def create_app(settings: Settings) -> None:
         status: Message,
         max_bytes: int,
         cancelled: threading.Event,
+        preferred_backend: str | None = None,
     ) -> None:
         token = secrets.token_urlsafe(32)
         stored_name = secrets.token_hex(16)
@@ -727,7 +728,7 @@ async def create_app(settings: Settings) -> None:
                     upload_source = telegram_cache_source or destination
                     backend_name = await object_storage.upload(
                         upload_source, object_key, media.mime_type, cloud_progress,
-                        backend_usage, cancelled.is_set,
+                        backend_usage, cancelled.is_set, preferred_backend,
                     )
                     uploaded_backend = backend_name
                 finally:
@@ -739,8 +740,12 @@ async def create_app(settings: Settings) -> None:
                      if telegram_cache_source is not None else
                      f"مرحله ۴ از ۴ — انتقال ابری کامل شد\nفضای انتخاب‌شده: {backend_name}")
                 )
-                replication_count = max(
-                    1, int(await storage.get_setting("replication_count", "1"))
+                # A user-selected destination is authoritative. Automatic mode
+                # retains the administrator's configured replication policy.
+                replication_count = (
+                    1 if preferred_backend else max(
+                        1, int(await storage.get_setting("replication_count", "1"))
+                    )
                 )
                 if replication_count > 1:
                     await status.edit_text(
@@ -811,9 +816,13 @@ async def create_app(settings: Settings) -> None:
             disable_web_page_preview=True,
         )
 
-    @router.callback_query(F.data.startswith("upload:confirm:"))
+    @router.callback_query(F.data.startswith("upload:dest:"))
     async def confirm_upload(callback: CallbackQuery) -> None:
-        nonce = (callback.data or "").removeprefix("upload:confirm:")
+        parts = (callback.data or "").split(":", 3)
+        if len(parts) != 4:
+            await callback.answer("درخواست نامعتبر است", show_alert=True)
+            return
+        nonce, selected = parts[2], parts[3]
         pending = pending_uploads.get(nonce)
         if pending is None or time.monotonic() - pending.created_at > 600:
             pending_uploads.pop(nonce, None)
@@ -824,6 +833,12 @@ async def create_app(settings: Settings) -> None:
         if callback.from_user.id != pending.requester_id:
             await callback.answer("فقط ارسال‌کننده فایل می‌تواند تصمیم بگیرد", show_alert=True)
             return
+        preferred_backend = None if selected == "auto" else selected
+        if preferred_backend:
+            backend = object_storage.backends.get(preferred_backend) if object_storage else None
+            if backend is None or backend.role not in {"primary", "replica"}:
+                await callback.answer("فضای انتخاب‌شده دیگر در دسترس نیست", show_alert=True)
+                return
         pending_uploads.pop(nonce, None)
         cancelled = threading.Event()
         active_uploads[nonce] = (pending.requester_id, cancelled)
@@ -839,7 +854,8 @@ async def create_app(settings: Settings) -> None:
         )
         try:
             await perform_upload(
-                pending.media, callback.message, pending.max_bytes, cancelled
+                pending.media, callback.message, pending.max_bytes, cancelled,
+                preferred_backend,
             )
         finally:
             active_uploads.pop(nonce, None)
@@ -930,16 +946,36 @@ async def create_app(settings: Settings) -> None:
             max_bytes=max_bytes,
             created_at=now,
         )
+        destination_buttons: list[list[InlineKeyboardButton]] = []
+        if object_storage is not None:
+            for backend in object_storage.backends.values():
+                if backend.role not in {"primary", "replica"}:
+                    continue
+                endpoint = backend.endpoint_url.lower()
+                is_iran = endpoint.endswith(".ir") or ".ir/" in endpoint or "parspack" in endpoint
+                label = "🇮🇷 ایران" if is_iran else "🌍 خارج"
+                destination_buttons.append([
+                    InlineKeyboardButton(
+                        text=f"{label} — {backend.name}",
+                        callback_data=f"upload:dest:{nonce}:{backend.name}",
+                    )
+                ])
+            destination_buttons.append([
+                InlineKeyboardButton(
+                    text="⚡ انتخاب خودکار و نسخه پشتیبان",
+                    callback_data=f"upload:dest:{nonce}:auto",
+                )
+            ])
+        destination_buttons.append([
+            InlineKeyboardButton(text="لغو فرایند", callback_data=f"upload:cancel:{nonce}")
+        ])
         await message.answer(
             "مرحله ۱ — تأیید آپلود\n\n"
             f"نام فایل: {hbold(original_name)}\n"
             f"حجم: {human_size(media.file_size) if media.file_size else 'نامشخص'}\n\n"
-            "آیا فایل روی سرور آپلود و لینک دانلود ساخته شود؟",
+            "فضای ذخیره‌سازی فایل را انتخاب کنید:",
             parse_mode=ParseMode.HTML,
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="آپلود روی سرور", callback_data=f"upload:confirm:{nonce}"),
-                InlineKeyboardButton(text="لغو فرایند", callback_data=f"upload:cancel:{nonce}"),
-            ]]),
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=destination_buttons),
         )
 
     @router.message()

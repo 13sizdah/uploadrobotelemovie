@@ -46,6 +46,37 @@ class ObjectStorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([item.name for item in manager._candidates()], ["main"])
         self.assertEqual(manager.replication_targets("main", 3, 10), ["iran"])
 
+    async def test_explicit_replica_backend_can_be_selected_for_upload(self) -> None:
+        manager = ObjectStorageManager(
+            (
+                config("outside", 1, role="primary"),
+                config("iran", 2, role="replica"),
+            ),
+            8,
+            300,
+        )
+        calls: list[str] = []
+
+        class FakeClient:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def upload_file(self, *args, **kwargs):
+                calls.append(self.name)
+
+        for name, backend in manager.backends.items():
+            backend.client = lambda name=name: FakeClient(name)  # type: ignore[method-assign]
+
+        selected = await manager.upload(
+            Path(__file__),
+            "files/selected",
+            "application/octet-stream",
+            preferred_backend="iran",
+        )
+
+        self.assertEqual(selected, "iran")
+        self.assertEqual(calls, ["iran"])
+
     async def test_user_cancellation_does_not_mark_backend_unhealthy(self) -> None:
         manager = ObjectStorageManager((config("primary", 1),), 8, 300)
         backend = manager.backends["primary"]

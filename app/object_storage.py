@@ -153,12 +153,24 @@ class ObjectStorageManager:
         progress: Callable[[int], None] | None = None,
         usage: dict[str, int] | None = None,
         cancelled: Callable[[], bool] | None = None,
+        preferred_backend: str | None = None,
     ) -> str:
         errors: list[str] = []
         incoming_size = source.stat().st_size
-        candidates = self._candidates(incoming_size, usage)
+        if preferred_backend:
+            candidates = [
+                backend for backend in self._candidates(
+                    incoming_size, usage, purpose="replica"
+                )
+                if backend.name == preferred_backend
+            ]
+        else:
+            candidates = self._candidates(incoming_size, usage)
         if not candidates:
-            raise RuntimeError("No healthy S3 backend has enough configured capacity")
+            detail = f" for {preferred_backend}" if preferred_backend else ""
+            raise RuntimeError(
+                "No healthy S3 backend has enough configured capacity" + detail
+            )
         for backend in candidates:
             transferred = 0
             lock = threading.Lock()

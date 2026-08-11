@@ -207,7 +207,62 @@ class Storage:
                     PRIMARY KEY(day, backend_name)
                 )"""
             )
+            await db.execute(
+                """CREATE TABLE IF NOT EXISTS bot_users (
+                    user_id INTEGER PRIMARY KEY,
+                    username TEXT NOT NULL DEFAULT '',
+                    full_name TEXT NOT NULL DEFAULT '',
+                    last_seen INTEGER NOT NULL,
+                    blocked INTEGER NOT NULL DEFAULT 0
+                )"""
+            )
             await db.commit()
+
+    async def upsert_user(
+        self, user_id: int, username: str = "", full_name: str = ""
+    ) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """INSERT INTO bot_users(user_id, username, full_name, last_seen, blocked)
+                   VALUES (?, ?, ?, ?, 0) ON CONFLICT(user_id) DO UPDATE SET
+                   username=excluded.username, full_name=excluded.full_name,
+                   last_seen=excluded.last_seen, blocked=0""",
+                (user_id, username[:100], full_name[:200], int(time.time())),
+            )
+            await db.commit()
+
+    async def broadcast_users(self) -> list[int]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT user_id FROM bot_users WHERE blocked = 0 "
+                "ORDER BY last_seen DESC, user_id DESC"
+            )
+            return [int(row[0]) for row in await cursor.fetchall()]
+
+    async def set_user_blocked(self, user_id: int, blocked: bool = True) -> None:
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                "UPDATE bot_users SET blocked = ? WHERE user_id = ?",
+                (1 if blocked else 0, user_id),
+            )
+            await db.commit()
+
+    async def user_statistics(self) -> tuple[int, int]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT COUNT(*), COALESCE(SUM(blocked), 0) FROM bot_users"
+            )
+            row = await cursor.fetchone()
+        return (int(row[0]), int(row[1])) if row else (0, 0)
+
+    async def recent_users(self, limit: int = 20) -> list[tuple[int, str, str, int, int]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                "SELECT user_id, username, full_name, last_seen, blocked "
+                "FROM bot_users ORDER BY last_seen DESC, user_id DESC LIMIT ?",
+                (limit,),
+            )
+            return await cursor.fetchall()
 
     async def ensure_setting(self, key: str, default: str) -> None:
         async with aiosqlite.connect(self.db_path) as db:

@@ -20,6 +20,7 @@ from aiogram import Bot, Dispatcher, F, Router
 from aiogram.client.session.aiohttp import AiohttpSession
 from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ParseMode
+from aiogram.exceptions import TelegramForbiddenError
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     CallbackQuery,
@@ -142,6 +143,8 @@ async def create_app(settings: Settings) -> None:
     await storage.ensure_setting("alert_disk_percent", "90")
     await storage.ensure_setting("alert_queue_count", "10")
     await storage.ensure_setting("offsite_backup_backend", "")
+    await storage.ensure_setting("button_start_title", "🏠 شروع")
+    await storage.ensure_setting("button_admin_title", "🛠 پنل مدیریت")
     await storage.ensure_setting(
         "admin_web_password_hash", settings.admin_web_password_hash or ""
     )
@@ -174,6 +177,12 @@ async def create_app(settings: Settings) -> None:
     dispatcher = Dispatcher()
     router = Router()
     admins_adding_source: set[int] = set()
+    admin_flows: dict[int, str] = {}
+    pending_broadcasts: dict[int, Message] = {}
+    button_titles = {
+        "start": await storage.get_setting("button_start_title", "🏠 شروع"),
+        "admin": await storage.get_setting("button_admin_title", "🛠 پنل مدیریت"),
+    }
     pending_uploads: dict[str, PendingUpload] = {}
     active_uploads: dict[str, tuple[int, threading.Event]] = {}
     bot_started_at = time.monotonic()
@@ -356,6 +365,14 @@ async def create_app(settings: Settings) -> None:
     def is_admin(user_id: int | None) -> bool:
         return bool(settings.admin_user_id and user_id == settings.admin_user_id)
 
+    async def track_user(message: Message) -> None:
+        if message.from_user:
+            await storage.upsert_user(
+                message.from_user.id,
+                message.from_user.username or "",
+                message.from_user.full_name or "",
+            )
+
     async def forward_only_enabled() -> bool:
         return await storage.get_setting("forward_only", "0") == "1"
 
@@ -364,17 +381,6 @@ async def create_app(settings: Settings) -> None:
             "غیرفعال‌کردن محدودیت فوروارد"
             if forward_only
             else "فعال‌کردن محدودیت فوروارد"
-        )
-
-    def persistent_keyboard(user_id: int | None) -> ReplyKeyboardMarkup:
-        rows = [[KeyboardButton(text="🏠 شروع")]]
-        if is_admin(user_id):
-            rows.append([KeyboardButton(text="🛠 پنل مدیریت")])
-        return ReplyKeyboardMarkup(
-            keyboard=rows,
-            resize_keyboard=True,
-            is_persistent=True,
-            input_field_placeholder="فایل را ارسال کنید یا یک گزینه را بزنید",
         )
         return InlineKeyboardMarkup(
             inline_keyboard=[
@@ -390,8 +396,28 @@ async def create_app(settings: Settings) -> None:
                 [InlineKeyboardButton(text=toggle_text, callback_data="admin:toggle_forward")],
                 [InlineKeyboardButton(text="افزودن مبدأ مجاز", callback_data="admin:add_source")],
                 [InlineKeyboardButton(text="مدیریت منابع", callback_data="admin:list_sources")],
+                [
+                    InlineKeyboardButton(text="منابع سرورها", callback_data="admin:servers"),
+                    InlineKeyboardButton(text="فضاهای ابری", callback_data="admin:storage"),
+                ],
+                [
+                    InlineKeyboardButton(text="پیام همگانی", callback_data="admin:broadcast"),
+                    InlineKeyboardButton(text="عنوان دکمه‌ها", callback_data="admin:buttons"),
+                ],
+                [InlineKeyboardButton(text="مدیریت کاربران", callback_data="admin:users")],
                 [InlineKeyboardButton(text="راهنما", callback_data="admin:help")],
             ]
+        )
+
+    def persistent_keyboard(user_id: int | None) -> ReplyKeyboardMarkup:
+        rows = [[KeyboardButton(text=button_titles["start"])]]
+        if is_admin(user_id):
+            rows.append([KeyboardButton(text=button_titles["admin"])])
+        return ReplyKeyboardMarkup(
+            keyboard=rows,
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="فایل را ارسال کنید یا یک گزینه را بزنید",
         )
 
     def format_uptime(seconds: int) -> str:
@@ -475,14 +501,187 @@ async def create_app(settings: Settings) -> None:
             return
         current_mode = await forward_only_enabled()
         mode = "فعال" if current_mode else "غیرفعال"
+        users, blocked = await storage.user_statistics()
+        _, active_files, _, active_size = await storage.statistics()
+        queue = await storage.pending_replication_count()
         await message.answer(
-            f"پنل مدیریت ربات\n\nحالت پذیرش فقط از منابع مجاز: {mode}",
+            "پنل مدیریت ربات\n\n"
+            f"کاربران: {users} | مسدود: {blocked}\n"
+            f"فایل فعال: {active_files} | حجم: {human_size(active_size)}\n"
+            f"صف انتقال: {queue}\n"
+            f"حالت پذیرش فقط از منابع مجاز: {mode}",
             reply_markup=admin_keyboard(current_mode),
         )
 
     @router.message(F.text == "🛠 پنل مدیریت")
     async def admin_panel_button(message: Message) -> None:
         await admin_panel(message)
+
+    @router.callback_query(F.data == "admin:servers")
+    async def admin_servers(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        disk = shutil.disk_usage(settings.data_dir)
+        workers = await storage.replication_workers()
+        queue = await storage.pending_replication_count()
+        lines = [
+            "🖥 منابع و سرورها",
+            "",
+            f"سرور اصلی: آزاد {human_size(disk.free)} از {human_size(disk.total)}",
+            f"صف انتقال: {queue}",
+        ]
+        now = int(time.time())
+        for worker_id, last_seen, current_job, completed, error, targets, enabled in workers:
+            state = "فعال" if enabled and now - last_seen < 90 else "آفلاین/متوقف"
+            lines.append(
+                f"Worker {worker_id}: {state} | کار فعلی: {current_job or '-'} | "
+                f"تکمیل‌شده: {completed} | مقصد: {targets or '-'}"
+            )
+            if error:
+                lines.append(f"آخرین خطا: {error}")
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("\n".join(lines))
+
+    @router.callback_query(F.data == "admin:users")
+    async def admin_users(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        total, blocked = await storage.user_statistics()
+        lines = [f"👥 کاربران: {total} | مسدود: {blocked}", ""]
+        for user_id, username, full_name, last_seen, is_blocked in await storage.recent_users():
+            identity = f"@{username}" if username else full_name or str(user_id)
+            state = "مسدود" if is_blocked else "فعال"
+            seen = datetime.fromtimestamp(last_seen).astimezone().strftime("%Y-%m-%d %H:%M")
+            lines.append(f"{identity} | {user_id} | {state} | {seen}")
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer("\n".join(lines))
+
+    @router.callback_query(F.data == "admin:storage")
+    async def admin_storage(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        buttons: list[list[InlineKeyboardButton]] = []
+        lines = ["☁️ مدیریت فضاهای ابری", ""]
+        labels = {"primary": "اصلی", "replica": "Replica", "download": "فقط دانلود", "disabled": "غیرفعال"}
+        for backend in object_storage.backends.values():
+            lines.append(
+                f"• {backend.name} | {labels.get(backend.role, backend.role)} | "
+                f"Latency: {backend.latency_ms:.0f}ms | خطا: {backend.failures}"
+            )
+            buttons.append([InlineKeyboardButton(
+                text=f"تغییر نقش {backend.name}",
+                callback_data=f"admin:storage_role:{backend.name}",
+            )])
+        buttons.append([InlineKeyboardButton(text="➕ افزودن فضای جدید", callback_data="admin:storage_add")])
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons)
+            )
+
+    @router.callback_query(F.data.startswith("admin:storage_role:"))
+    async def admin_storage_role(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        name = (callback.data or "").removeprefix("admin:storage_role:")
+        backend = object_storage.backends.get(name)
+        if backend is None:
+            await callback.answer("فضا پیدا نشد", show_alert=True)
+            return
+        roles = ["primary", "replica", "download", "disabled"]
+        role = roles[(roles.index(backend.role) + 1) % len(roles)]
+        if (
+            backend.role == "primary"
+            and role != "primary"
+            and sum(item.role == "primary" for item in object_storage.backends.values()) <= 1
+        ):
+            await callback.answer(
+                "ابتدا یک فضای دیگر را Primary کنید؛ آخرین فضای اصلی قابل غیرفعال‌سازی نیست.",
+                show_alert=True,
+            )
+            return
+        configs = object_storage.export_configs()
+        for config in configs:
+            if config["name"] == name:
+                config["role"] = role
+                config["enabled"] = role != "disabled"
+        await encrypted_config.save(configs)
+        object_storage.replace_configs(configs)
+        await storage.add_audit(str(callback.from_user.id), "bot.storage.role", f"{name}:{role}")
+        await callback.answer(f"نقش {name}: {role}", show_alert=True)
+
+    @router.callback_query(F.data == "admin:storage_add")
+    async def admin_storage_add(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        admin_flows[callback.from_user.id] = "storage_add"
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "مشخصات S3 را در یک پیام و با جداکننده | بفرستید:\n"
+                "name | https://endpoint | bucket | region | access_key | secret_key | role\n\n"
+                "role یکی از primary، replica، download یا disabled است. پیام کلید بعد از دریافت حذف می‌شود."
+            )
+
+    @router.callback_query(F.data == "admin:broadcast")
+    async def admin_broadcast(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        admin_flows[callback.from_user.id] = "broadcast"
+        await callback.answer()
+        if callback.message:
+            total, blocked = await storage.user_statistics()
+            await callback.message.answer(
+                f"متن پیام همگانی را ارسال کنید. کاربران ثبت‌شده: {total} | مسدود: {blocked}"
+            )
+
+    @router.callback_query(F.data == "admin:buttons")
+    async def admin_buttons(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id):
+            await callback.answer("دسترسی ندارید", show_alert=True)
+            return
+        admin_flows[callback.from_user.id] = "buttons"
+        await callback.answer()
+        if callback.message:
+            await callback.message.answer(
+                "عنوان دکمه شروع و پنل را با | جدا کنید:\nمثال: 🏠 خانه | ⚙️ مدیریت"
+            )
+
+    @router.callback_query(F.data == "admin:broadcast_confirm")
+    async def admin_broadcast_confirm(callback: CallbackQuery) -> None:
+        if not is_admin(callback.from_user.id) or callback.from_user.id not in pending_broadcasts:
+            await callback.answer("پیش‌نمایش فعالی نیست", show_alert=True)
+            return
+        source = pending_broadcasts.pop(callback.from_user.id)
+        sent = failed = 0
+        for user_id in await storage.broadcast_users():
+            try:
+                await bot.send_message(user_id, source.text or "")
+                sent += 1
+            except TelegramForbiddenError:
+                failed += 1
+                await storage.set_user_blocked(user_id)
+            except Exception:
+                failed += 1
+            await asyncio.sleep(0.04)
+        await storage.add_audit(str(callback.from_user.id), "bot.broadcast", f"sent={sent},failed={failed}")
+        await callback.answer("ارسال پایان یافت", show_alert=True)
+        if callback.message:
+            await callback.message.answer(f"پیام همگانی کامل شد؛ موفق: {sent} | ناموفق: {failed}")
+
+    @router.callback_query(F.data == "admin:flow_cancel")
+    async def admin_flow_cancel(callback: CallbackQuery) -> None:
+        admin_flows.pop(callback.from_user.id, None)
+        pending_broadcasts.pop(callback.from_user.id, None)
+        await callback.answer("لغو شد", show_alert=True)
 
     @router.callback_query(F.data == "admin:toggle_forward")
     async def admin_toggle_forward(callback: CallbackQuery) -> None:
@@ -670,6 +869,7 @@ async def create_app(settings: Settings) -> None:
         if not is_allowed(message):
             await message.answer("⛔️ شما اجازه استفاده از این ربات را ندارید.")
             return
+        await track_user(message)
         await message.answer(
             "سلام! فایل یا رسانه موردنظر را برای من بفرستید.\n"
             "فرمت‌های فایل، ویدئو، عکس، صوت، ویس، GIF و استیکر پشتیبانی می‌شوند.\n"
@@ -688,6 +888,82 @@ async def create_app(settings: Settings) -> None:
     @router.message(F.text == "🏠 شروع")
     async def start_button(message: Message) -> None:
         await start(message)
+
+    @router.message(F.text)
+    async def admin_text_flows(message: Message) -> None:
+        user_id = message.from_user.id if message.from_user else 0
+        if message.text == button_titles["start"]:
+            await start(message)
+            return
+        if message.text == button_titles["admin"]:
+            await admin_panel(message)
+            return
+        flow = admin_flows.get(user_id)
+        if not flow or not is_admin(user_id):
+            if is_allowed(message):
+                await message.answer("لطفاً یک فایل ارسال کنید یا از دکمه‌های پایین استفاده کنید.")
+            return
+        if flow == "broadcast":
+            pending_broadcasts[user_id] = message
+            admin_flows.pop(user_id, None)
+            await message.answer(
+                f"پیش‌نمایش پیام:\n\n{message.text}\n\nارسال شود؟",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                    InlineKeyboardButton(text="✅ ارسال همگانی", callback_data="admin:broadcast_confirm"),
+                    InlineKeyboardButton(text="لغو", callback_data="admin:flow_cancel"),
+                ]]),
+            )
+            return
+        if flow == "buttons":
+            parts = [value.strip() for value in message.text.split("|", 1)]
+            if len(parts) != 2 or not all(1 <= len(value) <= 32 for value in parts):
+                await message.answer("فرمت نامعتبر است؛ دو عنوان ۱ تا ۳۲ کاراکتری با | ارسال کنید.")
+                return
+            button_titles["start"], button_titles["admin"] = parts
+            await storage.set_setting("button_start_title", parts[0])
+            await storage.set_setting("button_admin_title", parts[1])
+            await storage.add_audit(str(user_id), "bot.buttons.update", "titles changed")
+            admin_flows.pop(user_id, None)
+            await message.answer(
+                "✅ عنوان دکمه‌ها ذخیره شد.",
+                reply_markup=persistent_keyboard(user_id),
+            )
+            return
+        if flow == "storage_add":
+            parts = [value.strip() for value in message.text.split("|")]
+            with suppress(Exception):
+                await message.delete()
+            if len(parts) != 7:
+                await message.answer("❌ دقیقاً ۷ مقدار با | لازم است. دوباره ارسال کنید.")
+                return
+            name, endpoint, bucket, region, access_key, secret_key, role = parts
+            if (
+                not name or name in object_storage.backends
+                or not endpoint.startswith("https://")
+                or role not in {"primary", "replica", "download", "disabled"}
+            ):
+                await message.answer("❌ نام تکراری، Endpoint یا Role نامعتبر است.")
+                return
+            config: dict[str, object] = {
+                "name": name, "endpoint_url": endpoint.rstrip("/"), "bucket": bucket,
+                "region": region or "auto", "access_key_id": access_key,
+                "secret_access_key": secret_key, "priority": 100,
+                "enabled": role != "disabled", "role": role,
+                "capacity_bytes": 0, "reserve_bytes": 0,
+            }
+            probe = ObjectStorageManager((config,), settings.s3_multipart_chunk_mb, settings.s3_presigned_url_seconds)
+            backend = probe.backends[name]
+            if not await probe.health_check(backend):
+                await message.answer("❌ اتصال یا دسترسی Bucket ناموفق بود؛ چیزی ذخیره نشد.")
+                return
+            configs = object_storage.export_configs() + [config]
+            await encrypted_config.save(configs)
+            object_storage.replace_configs(configs)
+            await storage.set_setting("storage_backend", "s3")
+            await storage.add_audit(str(user_id), "bot.storage.add", name)
+            admin_flows.pop(user_id, None)
+            await message.answer(f"✅ فضای {name} آزمایش، رمزگذاری و اضافه شد.")
+            return
 
     async def perform_upload(
         media: IncomingFile,
@@ -966,6 +1242,7 @@ async def create_app(settings: Settings) -> None:
         if not is_allowed(message):
             await message.answer("⛔️ شما اجازه استفاده از این ربات را ندارید.")
             return
+        await track_user(message)
         media = incoming_file(message)
         if media is None:
             await message.answer("❌ این پیام حاوی فایل قابل دریافت نیست.")

@@ -46,6 +46,17 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(await self.storage.backend_reference_count("minio"), 1)
         self.assertEqual(await self.storage.backend_reference_count("unused"), 0)
 
+    async def test_user_registry_supports_broadcast_and_blocked_users(self) -> None:
+        await self.storage.upsert_user(10, "first", "First User")
+        await self.storage.upsert_user(20, "second", "Second User")
+        self.assertEqual(await self.storage.user_statistics(), (2, 0))
+        self.assertEqual(await self.storage.broadcast_users(), [20, 10])
+
+        await self.storage.set_user_blocked(10)
+
+        self.assertEqual(await self.storage.user_statistics(), (2, 1))
+        self.assertEqual(await self.storage.broadcast_users(), [20])
+
     async def test_migration_switch_and_replicas_are_atomic(self) -> None:
         item = StoredFile("token", "stored", "movie.mkv", "video/x-matroska", 10, 4_000_000_000)
         await self.storage.add(item)

@@ -25,10 +25,12 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
+    KeyboardButton,
     FSInputFile,
     Message,
     MessageOriginChannel,
     MessageOriginUser,
+    ReplyKeyboardMarkup,
 )
 from aiogram.utils.markdown import hbold, hcode, hlink
 
@@ -363,6 +365,17 @@ async def create_app(settings: Settings) -> None:
             if forward_only
             else "فعال‌کردن محدودیت فوروارد"
         )
+
+    def persistent_keyboard(user_id: int | None) -> ReplyKeyboardMarkup:
+        rows = [[KeyboardButton(text="🏠 شروع")]]
+        if is_admin(user_id):
+            rows.append([KeyboardButton(text="🛠 پنل مدیریت")])
+        return ReplyKeyboardMarkup(
+            keyboard=rows,
+            resize_keyboard=True,
+            is_persistent=True,
+            input_field_placeholder="فایل را ارسال کنید یا یک گزینه را بزنید",
+        )
         return InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -466,6 +479,10 @@ async def create_app(settings: Settings) -> None:
             f"پنل مدیریت ربات\n\nحالت پذیرش فقط از منابع مجاز: {mode}",
             reply_markup=admin_keyboard(current_mode),
         )
+
+    @router.message(F.text == "🛠 پنل مدیریت")
+    async def admin_panel_button(message: Message) -> None:
+        await admin_panel(message)
 
     @router.callback_query(F.data == "admin:toggle_forward")
     async def admin_toggle_forward(callback: CallbackQuery) -> None:
@@ -662,8 +679,15 @@ async def create_app(settings: Settings) -> None:
                 else "محدودیت حجم داخلی: ندارد\n"
             )
             +
-            f"زمان اعتبار لینک: {settings.file_ttl_hours} ساعت"
+            f"زمان اعتبار لینک: {settings.file_ttl_hours} ساعت",
+            reply_markup=persistent_keyboard(
+                message.from_user.id if message.from_user else None
+            ),
         )
+
+    @router.message(F.text == "🏠 شروع")
+    async def start_button(message: Message) -> None:
+        await start(message)
 
     async def perform_upload(
         media: IncomingFile,

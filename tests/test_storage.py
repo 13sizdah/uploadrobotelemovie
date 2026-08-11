@@ -121,6 +121,32 @@ class StorageTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(workers[0][0], "iran-1")
         self.assertEqual(workers[0][3], 1)
 
+    async def test_promoted_replication_atomically_replaces_transit_primary(self) -> None:
+        item = StoredFile(
+            "iran-only", "spool", "movie.mkv", "video/x-matroska",
+            500, 4_000_000_000, "bunny", "files/iran-only",
+        )
+        await self.storage.add_with_replication_jobs(
+            item,
+            [("parspack", "files/iran-only")],
+            promote_target="parspack",
+        )
+
+        before = await self.storage.get("iran-only")
+        self.assertEqual(before.backend_name, "bunny")
+        claimed = await self.storage.claim_replication_job("iran-1", ["parspack"])
+        self.assertTrue(claimed.promote_target)
+        completion = await self.storage.finish_claimed_replication_job(
+            claimed.id, "iran-1"
+        )
+
+        self.assertTrue(completion.promoted)
+        self.assertEqual(completion.old_backend, "bunny")
+        after = await self.storage.get("iran-only")
+        self.assertEqual(after.backend_name, "parspack")
+        self.assertEqual(after.object_key, "files/iran-only")
+        self.assertEqual(await self.storage.replicas_for("iran-only"), [])
+
     async def test_local_worker_can_exclude_remote_targets(self) -> None:
         item = StoredFile(
             "routing", "spool", "movie.mkv", "video/x-matroska",

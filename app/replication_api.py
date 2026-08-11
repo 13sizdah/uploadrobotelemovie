@@ -5,13 +5,17 @@ import time
 from aiohttp import web
 
 from .storage import Storage
+from .object_storage import ObjectStorageManager
 
 
 class ReplicationAPI:
     """Authenticated controller API used by remote replication workers."""
 
-    def __init__(self, storage: Storage) -> None:
+    def __init__(
+        self, storage: Storage, object_storage: ObjectStorageManager | None = None
+    ) -> None:
         self.storage = storage
+        self.object_storage = object_storage
         self.failed_auth: dict[str, list[float]] = {}
 
     def install(self, app: web.Application) -> None:
@@ -62,6 +66,7 @@ class ReplicationAPI:
                 "mime_type": job.mime_type,
                 "size": job.size,
                 "attempts": job.attempts,
+                "promote_target": job.promote_target,
             }
         )
 
@@ -70,11 +75,18 @@ class ReplicationAPI:
         data = await request.json()
         worker_id = str(data.get("worker_id", ""))[:100]
         job_id = int(request.match_info["job_id"])
-        token = await self.storage.finish_claimed_replication_job(job_id, worker_id)
-        if token is None:
+        completion = await self.storage.finish_claimed_replication_job(job_id, worker_id)
+        if completion is None:
             raise web.HTTPConflict(text="Job lease is no longer valid")
-        if await self.storage.pending_replication_count(token) == 0:
-            item = await self.storage.get(token)
+        if completion.promoted and self.object_storage and completion.old_backend and completion.old_object_key:
+            try:
+                await self.object_storage.delete(completion.old_backend, completion.old_object_key)
+            except Exception:
+                # The database already points at the verified target. A stale
+                # transit object is safe and can be cleaned up later.
+                pass
+        if await self.storage.pending_replication_count(completion.token) == 0:
+            item = await self.storage.get(completion.token)
             if item is not None:
                 await self.storage.delete_stored_file(item.stored_name)
         return web.json_response({"ok": True})

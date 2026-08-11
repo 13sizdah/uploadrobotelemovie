@@ -28,6 +28,7 @@ class ReplicationJob:
     target_backend: str
     object_key: str
     attempts: int
+    promote_target: bool = False
 
 
 @dataclass(frozen=True)
@@ -42,6 +43,15 @@ class ClaimedReplicationJob:
     original_name: str
     mime_type: str
     size: int
+    promote_target: bool = False
+
+
+@dataclass(frozen=True)
+class ReplicationCompletion:
+    token: str
+    promoted: bool = False
+    old_backend: str | None = None
+    old_object_key: str | None = None
 
 
 @dataclass(frozen=True)
@@ -148,6 +158,10 @@ class Storage:
             if "lease_until" not in job_columns:
                 await db.execute(
                     "ALTER TABLE replication_jobs ADD COLUMN lease_until INTEGER NOT NULL DEFAULT 0"
+                )
+            if "promote_target" not in job_columns:
+                await db.execute(
+                    "ALTER TABLE replication_jobs ADD COLUMN promote_target INTEGER NOT NULL DEFAULT 0"
                 )
             await db.execute(
                 """CREATE TABLE IF NOT EXISTS replication_workers (
@@ -376,6 +390,7 @@ class Storage:
         self,
         item: StoredFile,
         targets: list[tuple[str, str]],
+        promote_target: str | None = None,
     ) -> None:
         now = int(time.time())
         async with aiosqlite.connect(self.db_path) as db:
@@ -392,9 +407,12 @@ class Storage:
             if targets:
                 await db.executemany(
                     """INSERT INTO replication_jobs
-                    (token, target_backend, object_key, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?)""",
-                    [(item.token, backend, key, now, now) for backend, key in targets],
+                    (token, target_backend, object_key, created_at, updated_at, promote_target)
+                    VALUES (?, ?, ?, ?, ?, ?)""",
+                    [
+                        (item.token, backend, key, now, now, 1 if backend == promote_target else 0)
+                        for backend, key in targets
+                    ],
                 )
             await db.commit()
 
@@ -409,7 +427,8 @@ class Storage:
         params.append(limit)
         async with aiosqlite.connect(self.db_path) as db:
             cursor = await db.execute(
-                f"""SELECT j.id, j.token, j.target_backend, j.object_key, j.attempts
+                f"""SELECT j.id, j.token, j.target_backend, j.object_key, j.attempts,
+                           j.promote_target
                    FROM replication_jobs j JOIN files f ON f.token = j.token
                    WHERE j.next_attempt_at <= ? AND f.expires_at > ?
                      AND (j.lease_until = 0 OR j.lease_until <= ?)
@@ -434,7 +453,8 @@ class Storage:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
                 f"""SELECT j.id, j.token, j.target_backend, j.object_key, j.attempts,
-                           f.backend_name, f.object_key, f.original_name, f.mime_type, f.size
+                           f.backend_name, f.object_key, f.original_name, f.mime_type, f.size,
+                           j.promote_target
                     FROM replication_jobs j JOIN files f ON f.token = j.token
                     WHERE j.next_attempt_at <= ? AND f.expires_at > ?
                       AND (j.lease_until = 0 OR j.lease_until <= ?)
@@ -470,13 +490,15 @@ class Storage:
 
     async def finish_claimed_replication_job(
         self, job_id: int, worker_id: str, error: str = ""
-    ) -> str | None:
+    ) -> ReplicationCompletion | None:
         now = int(time.time())
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("BEGIN IMMEDIATE")
             cursor = await db.execute(
-                """SELECT token, target_backend, object_key, attempts
-                   FROM replication_jobs WHERE id = ? AND claimed_by = ?""",
+                """SELECT j.token, j.target_backend, j.object_key, j.attempts,
+                          j.promote_target, f.backend_name, f.object_key
+                   FROM replication_jobs j JOIN files f ON f.token = j.token
+                   WHERE j.id = ? AND j.claimed_by = ?""",
                 (job_id, worker_id),
             )
             row = await cursor.fetchone()
@@ -497,10 +519,20 @@ class Storage:
                     (now, error[:300], worker_id),
                 )
             else:
-                await db.execute(
-                    "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
-                    (row[0], row[1], row[2], now),
-                )
+                if bool(row[4]):
+                    await db.execute(
+                        "UPDATE files SET backend_name = ?, object_key = ? WHERE token = ?",
+                        (row[1], row[2], row[0]),
+                    )
+                    await db.execute(
+                        "DELETE FROM file_replicas WHERE token = ? AND backend_name = ?",
+                        (row[0], row[1]),
+                    )
+                else:
+                    await db.execute(
+                        "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
+                        (row[0], row[1], row[2], now),
+                    )
                 await db.execute("DELETE FROM replication_jobs WHERE id = ?", (job_id,))
                 await db.execute(
                     """UPDATE replication_workers SET last_seen = ?, current_job = NULL,
@@ -508,7 +540,12 @@ class Storage:
                     (now, worker_id),
                 )
             await db.commit()
-        return str(row[0])
+        return ReplicationCompletion(
+            token=str(row[0]),
+            promoted=not error and bool(row[4]),
+            old_backend=str(row[5]) if not error and bool(row[4]) else None,
+            old_object_key=str(row[6]) if not error and bool(row[4]) else None,
+        )
 
     async def renew_replication_lease(
         self, job_id: int, worker_id: str, lease_seconds: int = 900
@@ -595,15 +632,31 @@ class Storage:
                 targets.update(value.strip() for value in row[0].split(",") if value.strip())
         return tuple(sorted(targets))
 
-    async def complete_replication_job(self, job: ReplicationJob) -> None:
+    async def complete_replication_job(self, job: ReplicationJob) -> ReplicationCompletion:
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("BEGIN")
-            await db.execute(
-                "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
-                (job.token, job.target_backend, job.object_key, int(time.time())),
+            await db.execute("BEGIN IMMEDIATE")
+            cursor = await db.execute(
+                "SELECT backend_name, object_key FROM files WHERE token = ?", (job.token,)
             )
+            source = await cursor.fetchone()
+            if job.promote_target:
+                await db.execute(
+                    "UPDATE files SET backend_name = ?, object_key = ? WHERE token = ?",
+                    (job.target_backend, job.object_key, job.token),
+                )
+            else:
+                await db.execute(
+                    "INSERT OR REPLACE INTO file_replicas VALUES (?, ?, ?, ?)",
+                    (job.token, job.target_backend, job.object_key, int(time.time())),
+                )
             await db.execute("DELETE FROM replication_jobs WHERE id = ?", (job.id,))
             await db.commit()
+        return ReplicationCompletion(
+            token=job.token,
+            promoted=job.promote_target,
+            old_backend=str(source[0]) if source and job.promote_target else None,
+            old_object_key=str(source[1]) if source and job.promote_target else None,
+        )
 
     async def fail_replication_job(self, job: ReplicationJob, error: str) -> None:
         attempts = job.attempts + 1

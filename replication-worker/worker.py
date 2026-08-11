@@ -94,6 +94,11 @@ def process(job: dict) -> None:
             str(destination), target["bucket"], job["target_object_key"],
             ExtraArgs={"ContentType": job["mime_type"]}, Config=TRANSFER,
         )
+        result = client(job["target_backend"]).head_object(
+            Bucket=target["bucket"], Key=job["target_object_key"]
+        )
+        if int(result["ContentLength"]) != int(job["size"]):
+            raise RuntimeError("Uploaded target size does not match source metadata")
         post(
             f"/internal/replication/{job_id}/complete",
             {"worker_id": WORKER_ID},

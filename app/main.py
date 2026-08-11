@@ -667,6 +667,8 @@ async def create_app(settings: Settings) -> None:
         uploaded_backend: str | None = None
         object_key: str | None = None
         replication_targets: list[tuple[str, str]] = []
+        promotion_target: str | None = None
+        placement_note = ""
         record_saved = False
         telegram_cache_source: Path | None = None
         try:
@@ -726,9 +728,24 @@ async def create_app(settings: Settings) -> None:
                 try:
                     backend_usage = await storage.backend_usage()
                     upload_source = telegram_cache_source or destination
+                    upload_preference = preferred_backend
+                    if preferred_backend:
+                        requested = object_storage.backends[preferred_backend]
+                        if requested.role == "replica":
+                            transit = object_storage._candidates(
+                                actual_size, backend_usage, purpose="primary"
+                            )
+                            if not transit:
+                                raise RuntimeError("No transit backend is available")
+                            upload_preference = transit[0].name
+                            promotion_target = preferred_backend
+                            placement_note = (
+                                f"\nمسیر: {upload_preference} (موقت) → "
+                                f"Worker ایران → {preferred_backend}"
+                            )
                     backend_name = await object_storage.upload(
                         upload_source, object_key, media.mime_type, cloud_progress,
-                        backend_usage, cancelled.is_set, preferred_backend,
+                        backend_usage, cancelled.is_set, upload_preference,
                     )
                     uploaded_backend = backend_name
                 finally:
@@ -747,7 +764,12 @@ async def create_app(settings: Settings) -> None:
                         1, int(await storage.get_setting("replication_count", "1"))
                     )
                 )
-                if replication_count > 1:
+                if promotion_target:
+                    replication_targets = [(promotion_target, object_key)]
+                    await status.edit_text(
+                        "نسخه موقت خارج آماده شد؛ انتقال سریع توسط Worker ایران در صف قرار گرفت…"
+                    )
+                elif replication_count > 1:
                     await status.edit_text(
                         "نسخه اصلی ثبت شد؛ replicaها در صف پایدار قرار می‌گیرند…"
                     )
@@ -774,7 +796,9 @@ async def create_app(settings: Settings) -> None:
             if backend_name == "local":
                 await storage.add(item)
             else:
-                await storage.add_with_replication_jobs(item, replication_targets)
+                await storage.add_with_replication_jobs(
+                    item, replication_targets, promote_target=promotion_target
+                )
                 if not replication_targets:
                     await storage.delete_stored_file(stored_name)
             record_saved = True
@@ -806,7 +830,7 @@ async def create_app(settings: Settings) -> None:
             f"📋 لینک برای کپی:\n{hcode(link)}\n\n"
             f"نام فایل: {hbold(original_name)}\n"
             f"حجم: {human_size(actual_size)}\n"
-            f"انقضا: {expiry}",
+            f"انقضا: {expiry}{placement_note}",
             parse_mode=ParseMode.HTML,
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -1069,7 +1093,7 @@ async def create_app(settings: Settings) -> None:
     web_app.router.add_get("/d/{token}", download_page)
     web_app.router.add_get("/download/{token}", download_file)
     web_app.router.add_get("/health", health)
-    ReplicationAPI(storage).install(web_app)
+    ReplicationAPI(storage, object_storage).install(web_app)
     active_admin_password_hash = await storage.get_setting(
         "admin_web_password_hash", settings.admin_web_password_hash or ""
     )
@@ -1149,7 +1173,16 @@ async def create_app(settings: Settings) -> None:
                         await object_storage.upload_to(
                             job.target_backend, source, job.object_key, item.mime_type
                         )
-                        await storage.complete_replication_job(job)
+                        completion = await storage.complete_replication_job(job)
+                        if (
+                            completion.promoted
+                            and completion.old_backend
+                            and completion.old_object_key
+                        ):
+                            with suppress(Exception):
+                                await object_storage.delete(
+                                    completion.old_backend, completion.old_object_key
+                                )
                         logger.info(
                             "Replication completed for %s to %s",
                             job.token,

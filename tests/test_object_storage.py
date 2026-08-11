@@ -143,6 +143,22 @@ class ObjectStorageTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(selected, ("enabled", "files/a"))
 
+    async def test_parspack_presign_omits_duplicate_content_disposition(self) -> None:
+        item = config("iran", 1)
+        item["endpoint_url"] = "https://bucket.parspack.net"
+        manager = ObjectStorageManager((item,), 8, 300)
+        captured: dict[str, object] = {}
+
+        class FakeClient:
+            def generate_presigned_url(self, operation, **kwargs):
+                captured.update(kwargs["Params"])
+                return "https://example.invalid/signed"
+
+        manager.backends["iran"].client = lambda: FakeClient()  # type: ignore[method-assign]
+        await manager.presigned_download("iran", "files/a", "video.mp4")
+
+        self.assertNotIn("ResponseContentDisposition", captured)
+
 
 if __name__ == "__main__":
     unittest.main()

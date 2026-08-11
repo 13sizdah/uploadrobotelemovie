@@ -404,13 +404,20 @@ class ObjectStorageManager:
         backend = self.backends.get(backend_name)
         if backend is None:
             raise RuntimeError(f"Unknown S3 backend: {backend_name}")
+        params = {
+            "Bucket": backend.bucket,
+            "Key": object_key,
+        }
+        # ParsPack emits its own Content-Disposition header. Asking S3 to
+        # override it produces two headers and Chromium rejects the response
+        # with ERR_RESPONSE_HEADERS_MULTIPLE_CONTENT_DISPOSITION.
+        if "parspack" not in backend.endpoint_url.lower():
+            params["ResponseContentDisposition"] = (
+                f'attachment; filename="{filename}"'
+            )
         return await asyncio.to_thread(
             backend.client().generate_presigned_url,
             "get_object",
-            Params={
-                "Bucket": backend.bucket,
-                "Key": object_key,
-                "ResponseContentDisposition": f'attachment; filename="{filename}"',
-            },
+            Params=params,
             ExpiresIn=self.presign_seconds,
         )
